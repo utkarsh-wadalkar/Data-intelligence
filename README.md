@@ -88,3 +88,7 @@ corepack pnpm build
 ```
 
 The backend tests use mocked providers and cover the workflow, authorization, quotas, scheduling, and exports. A real-provider smoke test should be kept small and run only after the free-tier spending controls have been verified.
+***
+## Architecture
+
+<img width="3669" height="8719" alt="diagram" src="https://github.com/user-attachments/assets/2f042007-13fc-4b16-b634-3cbd5c224775" />
