@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { BorderBeam } from "border-beam";
+import type { OrbState } from "thinking-orbs";
 import {
   OrganizationSwitcher,
   SignInButton,
@@ -10,6 +12,42 @@ import {
 import type { Field, RecordRow, Run, Source, Workflow } from "./types";
 
 const apiBase = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const ThinkingOrb = lazy(() =>
+  import("thinking-orbs").then(({ ThinkingOrb }) => ({ default: ThinkingOrb })),
+);
+const MetalFx = lazy(() =>
+  import("metal-fx").then(({ MetalFx }) => ({ default: MetalFx })),
+);
+
+function AuthMetal({ children }: { children: React.ReactElement }) {
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(preference.matches);
+    preference.addEventListener("change", update);
+    return () => preference.removeEventListener("change", update);
+  }, []);
+
+  return (
+    <Suspense fallback={children}>
+      <MetalFx className="auth-metal" preset="chromatic" strength={0.9} theme="light" paused={reducedMotion} disableGlow={reducedMotion} normalizeHostStyles={false}>
+        {children}
+      </MetalFx>
+    </Suspense>
+  );
+}
+
+function LoadingOrb({ state, theme = "light" }: { state: OrbState; theme?: "light" | "dark" }) {
+  return (
+    <span className="loading-orb" aria-hidden="true">
+      <Suspense fallback={null}>
+        <ThinkingOrb state={state} size={20} theme={theme} />
+      </Suspense>
+    </span>
+  );
+}
 
 function formatDate(value: string | null) {
   return value
@@ -19,6 +57,48 @@ function formatDate(value: string | null) {
 
 function statusLabel(status: string) {
   return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function BeamCard({
+  children,
+  className = "",
+  theme = "light",
+  subtle = false,
+}: {
+  children: React.ReactElement;
+  className?: string;
+  theme?: "light" | "dark";
+  subtle?: boolean;
+}) {
+  const [reducedMotion, setReducedMotion] = useState(false);
+  const [engaged, setEngaged] = useState(false);
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    setReducedMotion(preference.matches);
+    const update = () => setReducedMotion(preference.matches);
+    preference.addEventListener("change", update);
+    return () => preference.removeEventListener("change", update);
+  }, []);
+
+  return (
+    <BorderBeam
+      className={`beam-card ${className}`.trim()}
+      size="pulse-inner"
+      glowSize={2.2}
+      brightness={1.6}
+      strength={subtle ? 0.8 : 1}
+      theme={theme}
+      active={!reducedMotion && engaged}
+      onMouseEnter={() => setEngaged(true)}
+      onMouseLeave={() => setEngaged(false)}
+      onFocusCapture={() => setEngaged(true)}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setEngaged(false);
+      }}
+    >
+      {children}
+    </BorderBeam>
+  );
 }
 
 function Brand() {
@@ -31,75 +111,180 @@ function Brand() {
 
 export function Welcome() {
   return (
-    <main className="welcome">
+    <main className="welcome" id="top">
       <header className="welcome-nav">
-        <Brand />
-        <span>Data intelligence, on your terms</span>
+        <a className="welcome-home" href="#top" aria-label="SourcePilot, back to top">
+          <Brand />
+        </a>
+        <nav className="welcome-links" aria-label="Landing page">
+          <a href="#how-it-works">How it works</a>
+          <a href="#why-sourcepilot">Why SourcePilot</a>
+          <a href="#access">Access</a>
+        </nav>
+        <AuthMetal>
+          <SignInButton mode="redirect">
+            <button className="welcome-signin">Sign in</button>
+          </SignInButton>
+        </AuthMetal>
       </header>
-      <div className="welcome-content">
+
+      <section className="welcome-content" aria-labelledby="welcome-title">
         <div className="welcome-copy">
-          <div className="eyebrow">A clearer view of the web</div>
-          <h1>
-            From a question to a <em>living dataset.</em>
+          <h1 id="welcome-title">
+            Collect web data.<br />
+            <span>Keep the evidence.</span>
           </h1>
           <p>
-            Describe the information you need. Approve the fields and sources.
-            SourcePilot gathers traceable records and keeps them fresh on your
-            schedule.
+            Turn a plain-English research question into a structured dataset
+            with sources you can inspect and results you can revisit.
           </p>
           <div className="welcome-actions">
-            <SignInButton mode="redirect">
-              <button className="primary large">
-                Sign in <span aria-hidden>↗</span>
-              </button>
-            </SignInButton>
-            <SignUpButton mode="redirect">
-              <button className="secondary large">Create account</button>
-            </SignUpButton>
+            <AuthMetal>
+              <SignUpButton mode="redirect">
+                <button className="welcome-primary">Create account</button>
+              </SignUpButton>
+            </AuthMetal>
+            <a className="welcome-secondary" href="#how-it-works">See how it works</a>
           </div>
-          <small>Open your invitation email to join the shared workspace.</small>
         </div>
-        <div className="welcome-art" aria-hidden="true">
-          <div className="art-top">
+        <BeamCard className="beam-preview" theme="dark">
+        <div className="landing-preview" aria-label="Illustrative collection workflow with sample results">
+          <div className="preview-heading">
             <span>COLLECTION / 01</span>
-            <span>● LIVE</span>
+            <span className="preview-status">LIVE</span>
           </div>
-          <div className="art-question">
-            Find independent climate tech companies hiring product designers in
-            Europe.
+          <div className="preview-request">
+            <strong>Find independent climate tech companies hiring product designers in Europe.</strong>
           </div>
-          <div className="art-arrow">↓</div>
-          <div className="art-table">
-            <div>
-              <b>Company</b>
-              <b>Role</b>
-              <b>Location</b>
-            </div>
-            <div>
-              <span>Northstar</span>
-              <span>Product Designer</span>
-              <span>Berlin</span>
-            </div>
-            <div>
-              <span>Canopy</span>
-              <span>Senior Designer</span>
-              <span>Remote EU</span>
-            </div>
-            <div>
-              <span>Forma</span>
-              <span>Design Lead</span>
-              <span>Amsterdam</span>
-            </div>
+          <div className="preview-arrow" aria-hidden="true" />
+          <BeamCard className="beam-preview-output" subtle>
+          <div className="preview-output">
+            <table className="preview-table" aria-label="Illustrative results">
+              <thead>
+                <tr><th>Company</th><th>Role</th><th>Location</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Northstar</td><td>Product Designer</td><td>Berlin</td></tr>
+                <tr><td>Canopy</td><td>Senior Designer</td><td>Remote EU</td></tr>
+                <tr><td>Forma</td><td>Design Lead</td><td>Amsterdam</td></tr>
+              </tbody>
+            </table>
           </div>
-          <div className="art-bottom">
+          </BeamCard>
+          <div className="preview-bottom">
             <span>12 sources inspected</span>
             <span>Evidence attached to every record ↗</span>
           </div>
         </div>
-      </div>
+        </BeamCard>
+      </section>
+
+      <section className="landing-promises" aria-label="SourcePilot at a glance">
+        <div><strong>Approve the plan</strong><span>Set the fields before a run starts.</span></div>
+        <div><strong>Trace every record</strong><span>Inspect the source behind each result.</span></div>
+        <div><strong>Keep it current</strong><span>Schedule reruns into one dataset.</span></div>
+      </section>
+
+      <section className="landing-section landing-how" id="how-it-works" aria-labelledby="how-title">
+        <div className="landing-section-heading">
+          <h2 id="how-title">A clear path from question to dataset.</h2>
+          <p>SourcePilot handles the collection workflow while you stay in control of what the data means.</p>
+        </div>
+        <div className="landing-steps">
+          <article>
+            <span className="step-number">01</span>
+            <h3>Describe the need</h3>
+            <p>Write the data you want in plain English. SourcePilot proposes searches, fields, and record identity rules.</p>
+          </article>
+          <article>
+            <span className="step-number">02</span>
+            <h3>Approve the shape</h3>
+            <p>Edit the proposed queries and fields before the first run. The approved schema keeps later runs consistent.</p>
+          </article>
+          <article>
+            <span className="step-number">03</span>
+            <h3>Collect and revisit</h3>
+            <p>Review run progress, inspect evidence, search the accumulated records, and export CSV or JSON.</p>
+          </article>
+        </div>
+      </section>
+
+      <section className="landing-section landing-difference" id="why-sourcepilot" aria-labelledby="difference-title">
+        <div className="landing-section-heading">
+          <h2 id="difference-title">More useful than a one-off scrape.</h2>
+          <p>The value is in what happens after collection: a stable structure, a source trail, and a dataset you can return to.</p>
+        </div>
+        <div className="landing-feature-grid">
+          <BeamCard className="beam-feature beam-feature-evidence" theme="dark">
+          <article className="landing-feature landing-feature-evidence">
+            <div>
+              <h3>Answers with a trail.</h3>
+              <p>Every result carries a URL, a short evidence excerpt, and the time the page was fetched. Inspect the source before you act.</p>
+            </div>
+            <BeamCard className="beam-evidence-slip" subtle>
+            <div className="evidence-slip" aria-label="What each evidence field lets you verify">
+              <div><strong>Source URL</strong><span>Open the original page</span></div>
+              <div><strong>Evidence excerpt</strong><span>Match the claim to page text</span></div>
+              <div><strong>Fetched at</strong><span>Know when it was checked</span></div>
+            </div>
+            </BeamCard>
+          </article>
+          </BeamCard>
+          <BeamCard className="beam-feature beam-feature-schema">
+          <article className="landing-feature landing-feature-schema">
+            <h3>Your fields, your call.</h3>
+            <p>The generated plan is a draft. You approve the typed fields and identity rules before collection begins.</p>
+            <div className="schema-tags" aria-label="Example field types">
+              <span>title · text</span><span>deadline · date</span><span>region · text</span>
+            </div>
+          </article>
+          </BeamCard>
+          <BeamCard className="beam-feature beam-feature-history">
+          <article className="landing-feature landing-feature-history">
+            <h3>Set it once. Let it rerun.</h3>
+            <p>Choose a daily or weekly schedule. Each due run adds new observations to the same dataset, with run history intact.</p>
+            <BeamCard className="beam-rerun-flow" subtle>
+            <div className="rerun-flow" aria-label="Daily or weekly schedule starts the next run and updates the dataset">
+              <div><span>Schedule</span><strong>Daily / weekly</strong></div>
+              <span className="rerun-trigger" aria-hidden="true">
+                <Suspense fallback={null}>
+                  <ThinkingOrb state="composing" size={64} theme="light" />
+                </Suspense>
+              </span>
+              <div><span>Auto rerun</span><strong>Dataset updated</strong></div>
+            </div>
+            </BeamCard>
+          </article>
+          </BeamCard>
+        </div>
+      </section>
+
+      <section className="landing-section landing-compare" aria-labelledby="compare-title">
+        <h2 id="compare-title">From scattered research to a repeatable workflow.</h2>
+        <div className="compare-list">
+          <div><span>Setup</span><p>Describe the request and approve a plan instead of building a separate scraper for every question.</p></div>
+          <div><span>Confidence</span><p>Review source-backed records instead of losing the evidence in a spreadsheet export.</p></div>
+          <div><span>Follow-up</span><p>Rerun an approved workflow instead of rebuilding the same collection process next week.</p></div>
+        </div>
+      </section>
+
+      <BeamCard className="beam-access" theme="dark">
+      <section className="landing-access" id="access" aria-labelledby="access-title">
+        <div>
+          <h2 id="access-title">Start with a question. Leave with something you can verify.</h2>
+          <p>SourcePilot is available to invited members of the shared workspace. Public pages only, with free-provider limits and no paid model fallback.</p>
+        </div>
+        <AuthMetal>
+          <SignUpButton mode="redirect">
+            <button className="welcome-primary welcome-primary-light">Create account</button>
+          </SignUpButton>
+        </AuthMetal>
+      </section>
+      </BeamCard>
       <footer className="welcome-footer">
-        <span>QUESTION → SOURCES → EVIDENCE → DATASET</span>
-        <span>Built for decisions you can trace.</span>
+        <span>SourcePilot</span>
+        <span>Data you can trace back to its source.</span>
+        <a href="https://github.com/utkarsh-wadalkar/Data-intelligence" target="_blank" rel="noreferrer">GitHub</a>
       </footer>
     </main>
   );
@@ -397,6 +582,7 @@ export default function App() {
                 the first run begins. You can clone the collection later to
                 change it.
               </p>
+              <BeamCard className="beam-form">
               <div className="panel form-panel">
                 <label>
                   Collection name
@@ -560,11 +746,13 @@ export default function App() {
                     disabled={busy}
                     onClick={() => void approve()}
                   >
+                    {busy && <LoadingOrb state="connecting" theme="dark" />}
                     {busy ? "Starting…" : "Approve & start collection"}{" "}
-                    <span aria-hidden>→</span>
+                    {!busy && <span aria-hidden>→</span>}
                   </button>
                 </div>
               </div>
+              </BeamCard>
             </div>
           ) : !selected ? (
             <div className="content new-content">
@@ -575,6 +763,7 @@ export default function App() {
                 suggest searches and fields for you to approve before collecting
                 anything.
               </p>
+              <BeamCard className="beam-prompt">
               <form
                 className="prompt-form"
                 onSubmit={(event) => void makeDraft(event)}
@@ -594,11 +783,13 @@ export default function App() {
                 <div className="prompt-footer">
                   <span>Public sources only · Up to 12 pages per run</span>
                   <button className="primary" disabled={drafting}>
+                    {drafting && <LoadingOrb state="shaping" theme="dark" />}
                     {drafting ? "Designing fields…" : "Design collection"}{" "}
-                    <span aria-hidden>→</span>
+                    {!drafting && <span aria-hidden>→</span>}
                   </button>
                 </div>
               </form>
+              </BeamCard>
               <div className="how-it-works">
                 <div>
                   <b>01</b>
@@ -663,17 +854,22 @@ export default function App() {
               {view === "overview" ? (
                 <>
                   <div className="stats">
-                    <div>
+                    <BeamCard className="beam-stat">
+                    <div className="stat-card">
                       <span>RECORDS IN VIEW</span>
                       <strong>{records.length}</strong>
                       <small>Cumulative dataset</small>
                     </div>
-                    <div>
+                    </BeamCard>
+                    <BeamCard className="beam-stat">
+                    <div className="stat-card">
                       <span>COLLECTION RUNS</span>
                       <strong>{runs.length}</strong>
                       <small>History retained</small>
                     </div>
-                    <div>
+                    </BeamCard>
+                    <BeamCard className="beam-stat">
+                    <div className="stat-card">
                       <span>NEXT RUN</span>
                       <strong className="date-stat">
                         {selected.next_run_at
@@ -686,6 +882,7 @@ export default function App() {
                           : `${selected.cadence} · ${selected.timezone}`}
                       </small>
                     </div>
+                    </BeamCard>
                   </div>
                   <div className="section-heading">
                     <div>
@@ -708,11 +905,18 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  <BeamCard className="beam-panel">
                   <div className="panel activity-panel" aria-live="polite">
                     {runs.length ? (
                       runs.map((run) => (
                         <div className="run-row" key={run.id}>
-                          <span className={`run-indicator ${run.status}`} />
+                          {run.status === "running" ? (
+                            <LoadingOrb
+                              state={run.stage === "extracting" ? "composing" : run.stage === "searching" ? "searching" : "working"}
+                            />
+                          ) : (
+                            <span className={`run-indicator ${run.status}`} />
+                          )}
                           <div>
                             <b>
                               {statusLabel(run.status)}{" "}
@@ -778,12 +982,14 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  </BeamCard>
                   <div className="section-heading">
                     <div>
                       <h2>Schedule</h2>
                       <p>Repeat the approved collection automatically.</p>
                     </div>
                   </div>
+                  <BeamCard className="beam-panel">
                   <div className="panel schedule-panel">
                     <ScheduleEditor
                       workflow={selected}
@@ -817,6 +1023,7 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  </BeamCard>
                 </>
               ) : (
                 <>
@@ -869,6 +1076,7 @@ export default function App() {
                       disabled={!filterField}
                     />
                   </div>
+                  <BeamCard className="beam-table">
                   <div className="table-wrap">
                     <table>
                       <thead>
@@ -917,6 +1125,7 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  </BeamCard>
                 </>
               )}
             </div>
