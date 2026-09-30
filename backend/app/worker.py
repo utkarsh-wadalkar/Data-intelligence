@@ -294,6 +294,12 @@ def tick() -> list[str]:
         for run in db.scalars(select(Run).where(Run.status == "paused")).all():
             if run.pause_reason == "Per-run limit of three searches reached":
                 continue
+            reason = run.pause_reason or ""
+            if (
+                reason.startswith("OpenRouter rate limit reached")
+                or ("openrouter.ai" in reason and "429 Too Many Requests" in reason)
+            ) and run.started_at and now - run.started_at < timedelta(days=1):
+                continue
             run.status = "queued"
             run.stage = "retrying"
             run.pause_reason = None

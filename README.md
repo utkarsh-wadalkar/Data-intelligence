@@ -26,7 +26,7 @@ The first release uses one shared Clerk organization. Members can view and expor
 | API and workers | FastAPI, Python; Modal web endpoint, workers, and hourly scheduler |
 | Data | TiDB Cloud (MySQL protocol), SQLAlchemy 2, Alembic |
 | Authentication | Clerk Organizations and verified session JWTs |
-| Collection and extraction | Firecrawl free search/basic scrape; OpenRouter free structured-output models |
+| Collection and extraction | Firecrawl free search/basic scrape; OpenRouter free router with Qwen3.8 27B free fallback, returning JSON validated locally |
 
 ## Run locally (PowerShell)
 
@@ -75,7 +75,7 @@ Run `alembic upgrade head` manually from `backend/` against TiDB before deployme
 
 ## Cost and recovery limits
 
-Each run is limited to **3 searches, 12 scraped pages, 100 observations, and 10 minutes per execution attempt**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 Firecrawl credits per UTC month**. A search returning up to four results reserves two credits; each basic scrape reserves one. Provider or quota exhaustion pauses work with a visible reason. The hourly scheduler recovers eligible paused or queued work using the same run ID; a manual retry creates a new run. SourcePilot does not route to paid models or enhanced proxies.
+Each run is limited to **3 searches, 12 scraped pages, 100 observations, and 10 minutes per execution attempt**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 Firecrawl credits per UTC month**. A search returning up to four results reserves two credits; each basic scrape reserves one. Provider or quota exhaustion pauses work with a visible reason. The hourly scheduler recovers eligible paused or queued work using the same run ID, but waits at least 24 hours after an OpenRouter 429 to avoid exhausting search attempts during a daily rate limit; a manual retry creates a new run. SourcePilot does not route to paid models or enhanced proxies.
 
 ## Checks
 

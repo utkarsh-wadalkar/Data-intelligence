@@ -14,6 +14,18 @@ class ProviderUnavailable(Exception):
     pass
 
 
+def provider_error(response: httpx.Response) -> str:
+    try:
+        error = response.json().get("error")
+        if isinstance(error, dict):
+            error = error.get("message")
+        if isinstance(error, str) and error.strip():
+            return error.strip()[:200]
+    except (ValueError, AttributeError):
+        pass
+    return f"HTTP {response.status_code}"
+
+
 def ensure_search_ready() -> None:
     if not settings().firecrawl_api_key:
         raise ProviderUnavailable("Firecrawl free API key is missing")
@@ -47,19 +59,22 @@ def model_json(system: str, user: str, schema: dict) -> dict:
         if not config.openrouter_api_key:
             raise ProviderUnavailable("OpenRouter free API key is missing")
         body = {
-            "model": "openrouter/free",
+            "models": ["openrouter/free", "qwen/qwen3.8-27b:free"],
             "messages": [
-                {"role": "system", "content": system},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system}\nReturn exactly one JSON object matching this JSON Schema, "
+                        "without commentary or Markdown:\n"
+                        f"{json.dumps(schema)}"
+                    ),
+                },
                 {"role": "user", "content": user},
             ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "result", "strict": True, "schema": schema},
-            },
             "provider": {
                 "data_collection": "deny",
                 "require_parameters": True,
-                "allow_fallbacks": False,
+                "allow_fallbacks": True,
             },
             "temperature": 0,
         }
@@ -71,10 +86,25 @@ def model_json(system: str, user: str, schema: dict) -> dict:
                 timeout=45,
             )
             response.raise_for_status()
-            return json.loads(response.json()["choices"][0]["message"]["content"])
-        except (httpx.HTTPError, KeyError, ValueError, IndexError) as exc:
+            content = response.json()["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+            result = json.loads(content)
+            if not isinstance(result, dict):
+                raise ValueError("Model response was not a JSON object")
+            return result
+        except httpx.HTTPStatusError as exc:
+            reason = provider_error(exc.response)
+            if exc.response.status_code == 429:
+                raise ProviderUnavailable(f"OpenRouter rate limit reached: {reason}") from exc
             raise ProviderUnavailable(
-                f"No eligible free structured-output model: {str(exc)[:200]}"
+                f"OpenRouter request failed (HTTP {exc.response.status_code}): {reason}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailable(f"OpenRouter unavailable: {str(exc)[:200]}") from exc
+        except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
+            raise ProviderUnavailable(
+                f"OpenRouter returned invalid JSON: {str(exc)[:200]}"
             ) from exc
     if config.model_provider == "ollama":
         try:
@@ -205,10 +235,17 @@ def scrape(url: str) -> tuple[str, str]:
         payload = response.json()
         if payload.get("success") is False:
             reason = str(payload.get("error", "unknown error"))[:200]
-            if re.search(r"blocked|robots|login|paywall|access denied", reason, re.I):
+            if re.search(
+                r"blocked|robots|login|paywall|access denied|"
+                r"do not support this site|website not supported",
+                reason,
+                re.I,
+            ):
                 raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
             raise ProviderUnavailable(f"Firecrawl scrape unavailable: {reason}")
         data = payload.get("data", {})
+        if data.get("metadata", {}).get("statusCode") in {401, 403, 404, 410}:
+            raise ProviderUnavailable("Blocked or unavailable page skipped")
         markdown = data.get("markdown", "")
         if not markdown or re.search(
             r"\b(sign in|log in|subscribe to read|paywall)\b", markdown[:1500], re.I
@@ -217,11 +254,17 @@ def scrape(url: str) -> tuple[str, str]:
         return str(data.get("metadata", {}).get("title", ""))[:300], markdown[:30000]
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in {404, 410} or re.search(
-            r"blocked|robots|paywall|access denied", exc.response.text[:400], re.I
+            r"blocked|robots|paywall|access denied|do not support this site|website not supported",
+            exc.response.text[:400],
+            re.I,
         ):
             raise ProviderUnavailable("Blocked or unavailable page skipped") from exc
+        reason = provider_error(exc.response)
+        if exc.response.status_code == 403 and reason == "HTTP 403":
+            reason = "Check Firecrawl API key permissions or plan access"
         raise ProviderUnavailable(
-            f"Firecrawl scrape unavailable: HTTP {exc.response.status_code}"
+            f"Firecrawl scrape unavailable (HTTP {exc.response.status_code}): "
+            f"{reason}"
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise ProviderUnavailable(f"Firecrawl scrape unavailable: {str(exc)[:200]}") from exc

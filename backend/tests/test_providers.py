@@ -41,9 +41,12 @@ def test_free_provider_routing_and_basic_firecrawl(monkeypatch):
 
     monkeypatch.setattr(providers.httpx, "post", post)
     assert providers.model_json("system", "user", {"type": "object"}) == {"answer": "ok"}
-    assert calls[0][1]["model"] == "openrouter/free"
+    assert calls[0][1]["models"] == ["openrouter/free", "qwen/qwen3.8-27b:free"]
     assert calls[0][1]["provider"]["data_collection"] == "deny"
     assert calls[0][1]["provider"]["require_parameters"] is True
+    assert calls[0][1]["provider"]["allow_fallbacks"] is True
+    assert "response_format" not in calls[0][1]
+    assert '"type": "object"' in calls[0][1]["messages"][0]["content"]
     assert providers.search("example")[0]["url"] == "https://example.com"
     assert providers.scrape("https://example.com") == (
         "Example",
@@ -62,6 +65,101 @@ def test_blocked_page_is_skipped(monkeypatch):
     monkeypatch.setattr(providers.httpx, "post", blocked)
     with pytest.raises(providers.ProviderUnavailable, match="skipped"):
         providers.scrape("https://example.com/unavailable")
+
+
+def test_openrouter_rate_limit_is_reported_as_rate_limit(monkeypatch):
+    monkeypatch.setattr(
+        providers,
+        "settings",
+        lambda: SimpleNamespace(model_provider="openrouter", openrouter_api_key="test"),
+    )
+
+    def limited(url, **kwargs):
+        return httpx.Response(
+            429,
+            json={"error": {"message": "Free tier limit reached"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(providers.httpx, "post", limited)
+    with pytest.raises(providers.ProviderUnavailable, match="OpenRouter rate limit reached"):
+        providers.model_json("system", "user", {"type": "object"})
+
+
+def test_openrouter_accepts_fenced_json_from_free_model(monkeypatch):
+    monkeypatch.setattr(
+        providers,
+        "settings",
+        lambda: SimpleNamespace(model_provider="openrouter", openrouter_api_key="test"),
+    )
+
+    def post(url, **kwargs):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '```json\n{"answer":"ok"}\n```'}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(providers.httpx, "post", post)
+    assert providers.model_json("system", "user", {"type": "object"}) == {"answer": "ok"}
+
+
+def test_firecrawl_forbidden_exposes_provider_reason(monkeypatch):
+    monkeypatch.setattr(providers, "settings", lambda: SimpleNamespace(firecrawl_api_key="test"))
+
+    def forbidden(url, **kwargs):
+        return httpx.Response(
+            403,
+            json={"error": "Scrape is unavailable for this API key"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(providers.httpx, "post", forbidden)
+    with pytest.raises(
+        providers.ProviderUnavailable, match="Scrape is unavailable for this API key"
+    ):
+        providers.scrape("https://example.com/jobs")
+
+
+def test_firecrawl_forbidden_without_reason_points_to_key_access(monkeypatch):
+    monkeypatch.setattr(providers, "settings", lambda: SimpleNamespace(firecrawl_api_key="test"))
+
+    def forbidden(url, **kwargs):
+        return httpx.Response(403, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(providers.httpx, "post", forbidden)
+    with pytest.raises(providers.ProviderUnavailable, match="API key permissions"):
+        providers.scrape("https://example.com/jobs")
+
+
+def test_firecrawl_unsupported_site_is_skipped(monkeypatch):
+    monkeypatch.setattr(providers, "settings", lambda: SimpleNamespace(firecrawl_api_key="test"))
+
+    def unsupported(url, **kwargs):
+        return httpx.Response(
+            403,
+            json={"error": "We apologize, but we do not support this site."},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(providers.httpx, "post", unsupported)
+    with pytest.raises(providers.ProviderUnavailable, match="skipped"):
+        providers.scrape("https://example.com/jobs")
+
+
+def test_firecrawl_target_forbidden_page_is_skipped(monkeypatch):
+    monkeypatch.setattr(providers, "settings", lambda: SimpleNamespace(firecrawl_api_key="test"))
+
+    def forbidden_page(url, **kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"markdown": "Access denied", "metadata": {"statusCode": 403}}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(providers.httpx, "post", forbidden_page)
+    with pytest.raises(providers.ProviderUnavailable, match="skipped"):
+        providers.scrape("https://example.com/jobs")
 
 
 def test_invalid_free_model_draft_is_visible_provider_error(monkeypatch):

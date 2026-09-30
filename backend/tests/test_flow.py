@@ -115,6 +115,40 @@ def test_prompt_approval_collection_dedup_evidence_export(context, monkeypatch):
     assert client.get(f"/api/workflows/{workflow_id}/records?q=missing").json() == []
 
 
+def test_unsupported_source_does_not_pause_collection(context, monkeypatch):
+    client, _, _ = context
+    workflow_id, run_id = make_approved(client)
+    page = "Northstar is hiring a Product Designer in Berlin."
+    monkeypatch.setattr(
+        worker,
+        "search",
+        lambda query: [
+            {"url": "https://unsupported.example/jobs"},
+            {"url": "https://example.com/jobs"},
+        ],
+    )
+
+    def scrape(url):
+        if "unsupported.example" in url:
+            raise ProviderUnavailable("Blocked or unavailable page skipped")
+        return "Northstar jobs", page
+
+    monkeypatch.setattr(worker, "scrape", scrape)
+    monkeypatch.setattr(
+        worker,
+        "extract",
+        lambda page, fields: [
+            {
+                "data": {"company": "Northstar", "role": "Product Designer"},
+                "evidence": page,
+            }
+        ],
+    )
+    worker.process_run(run_id)
+    assert client.get(f"/api/runs/{run_id}").json()["status"] == "completed"
+    assert len(client.get(f"/api/workflows/{workflow_id}/records").json()) == 1
+
+
 def test_creator_admin_and_org_scope(context):
     client, _, _ = context
     workflow_id, run_id = make_approved(client)
@@ -205,6 +239,33 @@ def test_quota_pause_and_resume(context, monkeypatch):
             consume(db, "org_other", "model")
         with pytest.raises(QuotaExceeded):
             consume(db, "org_other", "model")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "OpenRouter rate limit reached: Free tier limit reached",
+        "No eligible free structured-output model: Client error '429 Too Many Requests' "
+        "for url 'https://openrouter.ai/api/v1/chat/completions'",
+    ],
+)
+def test_openrouter_rate_limit_waits_until_next_utc_day(context, reason):
+    client, sessions, _ = context
+    _, run_id = make_approved(client)
+    with sessions() as db:
+        run = db.get(Run, run_id)
+        run.status = "paused"
+        run.pause_reason = reason
+        run.started_at = utcnow()
+        db.commit()
+
+    assert run_id not in worker.tick()
+    with sessions() as db:
+        run = db.get(Run, run_id)
+        assert run.status == "paused"
+        run.started_at = utcnow() - timedelta(days=1)
+        db.commit()
+    assert run_id in worker.tick()
 
 
 def test_search_attempt_limit_survives_retries(context, monkeypatch):
