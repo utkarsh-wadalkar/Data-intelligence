@@ -98,8 +98,8 @@ def run_worker(run_id: str):
     drain_queue(run_id)
 
 
-@app.function(schedule=modal.Cron("0 * * * *"), timeout=600)
-def hourly_scheduler():
+@app.function(schedule=modal.Cron("* * * * *"), timeout=600)
+def minute_scheduler():
     require_spend_guards(os.environ)
     from app.worker import tick
 

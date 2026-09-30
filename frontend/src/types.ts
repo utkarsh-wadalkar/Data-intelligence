@@ -32,6 +32,9 @@ export type Run = {
   searched: number;
   scraped: number;
   observations: number;
+  retry_attempt: number;
+  next_retry_at: string | null;
+  recovery_count: number;
   created_at: string;
   finished_at: string | null;
 };

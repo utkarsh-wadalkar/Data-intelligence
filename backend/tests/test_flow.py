@@ -68,7 +68,29 @@ def make_approved(client):
         json={key: data[key] for key in ["title", "queries", "fields", "identity_fields"]},
     )
     assert approved.status_code == 200, approved.text
-    return data["id"], approved.json()["run"]["id"]
+    assert approved.json()["run"] is None
+    started = client.post(f"/api/workflows/{data['id']}/runs")
+    assert started.status_code == 201, started.text
+    return data["id"], started.json()["id"]
+
+
+def test_approval_waits_for_manual_first_run(context):
+    client, _, dispatched = context
+    draft = client.post("/api/drafts", json={"prompt": "Find public design jobs in Berlin"}).json()
+    approved = client.post(
+        f"/api/workflows/{draft['id']}/approve",
+        json={key: draft[key] for key in ["title", "queries", "fields", "identity_fields"]},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["run"] is None
+    assert client.get(f"/api/workflows/{draft['id']}/runs").json() == []
+    assert dispatched == []
+
+    first = client.post(f"/api/workflows/{draft['id']}/runs")
+    assert first.status_code == 201
+    assert first.json()["trigger"] == "manual"
+    assert dispatched == [first.json()["id"]]
+    assert client.post(f"/api/workflows/{draft['id']}/runs").status_code == 409
 
 
 def test_prompt_approval_collection_dedup_evidence_export(context, monkeypatch):
@@ -190,7 +212,8 @@ def test_schedule_claim_duplicate_and_recovery(context):
     workflow_id, run_id = make_approved(client)
     with sessions() as db:
         workflow = db.get(Workflow, workflow_id)
-        duplicate = enqueue_run(db, workflow, "approval", "approval")
+        first_run = db.get(Run, run_id)
+        duplicate = enqueue_run(db, workflow, first_run.trigger, first_run.run_key)
         assert duplicate.id == run_id
         second = enqueue_run(db, workflow, "manual", "manual:second")
         assert worker.claim(db, run_id)
@@ -230,6 +253,9 @@ def test_quota_pause_and_resume(context, monkeypatch):
     assert client.get(f"/api/runs/{run_id}").json()["status"] == "paused"
     assert "unavailable" in client.get(f"/api/workflows/{workflow_id}").json()["pause_reason"]
     monkeypatch.setattr(worker, "search", lambda query: [])
+    with sessions() as db:
+        db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
     assert run_id in worker.tick()
     worker.process_run(run_id)
     assert client.get(f"/api/runs/{run_id}").json()["status"] == "completed"
@@ -249,27 +275,77 @@ def test_quota_pause_and_resume(context, monkeypatch):
         "for url 'https://openrouter.ai/api/v1/chat/completions'",
     ],
 )
-def test_openrouter_rate_limit_waits_until_next_utc_day(context, reason):
+def test_openrouter_rate_limit_starts_with_one_minute_delay(context, reason):
     client, sessions, _ = context
     _, run_id = make_approved(client)
     with sessions() as db:
         run = db.get(Run, run_id)
         run.status = "paused"
         run.pause_reason = reason
-        run.started_at = utcnow()
         db.commit()
 
     assert run_id not in worker.tick()
     with sessions() as db:
         run = db.get(Run, run_id)
         assert run.status == "paused"
-        run.started_at = utcnow() - timedelta(days=1)
+        assert run.retry_attempt == 1
+        assert timedelta(seconds=50) < run.next_retry_at - utcnow() < timedelta(seconds=70)
+        run.next_retry_at = utcnow() - timedelta(seconds=1)
         db.commit()
     assert run_id in worker.tick()
 
 
+def test_rate_limit_phases_resume_saved_page_and_notify_recovery(context, monkeypatch):
+    client, sessions, _ = context
+    _, run_id = make_approved(client)
+    calls = {"search": 0, "scrape": 0, "extract": 0}
+
+    def search_once(query):
+        calls["search"] += 1
+        return [{"url": "https://example.com/jobs"}]
+
+    def scrape_once(url):
+        calls["scrape"] += 1
+        return "Jobs", "Northstar is hiring in Berlin."
+
+    def rate_limited(page, fields):
+        calls["extract"] += 1
+        if calls["extract"] <= len(worker.RATE_LIMIT_DELAYS):
+            raise ProviderUnavailable("OpenRouter rate limit reached: 429")
+        return []
+
+    monkeypatch.setattr(worker, "search", search_once)
+    monkeypatch.setattr(worker, "scrape", scrape_once)
+    monkeypatch.setattr(worker, "extract", rate_limited)
+
+    for attempt, delay in enumerate(worker.RATE_LIMIT_DELAYS, 1):
+        if attempt > 1:
+            with sessions() as db:
+                db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+                db.commit()
+            assert run_id in worker.tick()
+        worker.process_run(run_id)
+        with sessions() as db:
+            run = db.get(Run, run_id)
+            assert run.status == "paused"
+            assert run.retry_attempt == attempt
+            assert timedelta(minutes=delay) - timedelta(seconds=10) < run.next_retry_at - utcnow()
+            assert run.next_retry_at - utcnow() < timedelta(minutes=delay) + timedelta(seconds=10)
+
+    with sessions() as db:
+        db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+    assert run_id in worker.tick()
+    worker.process_run(run_id)
+    result = client.get(f"/api/runs/{run_id}").json()
+    assert result["status"] == "completed"
+    assert result["recovery_count"] == 1
+    assert result["retry_attempt"] == 0
+    assert calls == {"search": 1, "scrape": 1, "extract": 9}
+
+
 def test_search_attempt_limit_survives_retries(context, monkeypatch):
-    client, _, _ = context
+    client, sessions, _ = context
     workflow_id, run_id = make_approved(client)
     calls = []
 
@@ -280,10 +356,16 @@ def test_search_attempt_limit_survives_retries(context, monkeypatch):
     monkeypatch.setattr(worker, "search", unavailable)
     for attempt in range(3):
         if attempt:
+            with sessions() as db:
+                db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+                db.commit()
             assert run_id in worker.tick()
         worker.process_run(run_id)
         assert client.get(f"/api/runs/{run_id}").json()["searched"] == attempt + 1
 
+    with sessions() as db:
+        db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
     assert run_id in worker.tick()
     worker.process_run(run_id)
     run = client.get(f"/api/runs/{run_id}").json()

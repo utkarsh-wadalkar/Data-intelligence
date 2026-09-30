@@ -148,9 +148,9 @@ export function Welcome() {
           </div>
         </div>
         <BeamCard className="beam-preview" theme="dark">
-        <div className="landing-preview" aria-label="Illustrative collection workflow with sample results">
+        <div className="landing-preview" aria-label="Illustrative event with sample records">
           <div className="preview-heading">
-            <span>COLLECTION / 01</span>
+            <span>EVENT / 01</span>
             <span className="preview-status">LIVE</span>
           </div>
           <div className="preview-request">
@@ -188,7 +188,7 @@ export function Welcome() {
       <section className="landing-section landing-how" id="how-it-works" aria-labelledby="how-title">
         <div className="landing-section-heading">
           <h2 id="how-title">A clear path from question to dataset.</h2>
-          <p>SourcePilot handles the collection workflow while you stay in control of what the data means.</p>
+          <p>SourcePilot gathers public data for your event while you stay in control of what the records mean.</p>
         </div>
         <div className="landing-steps">
           <article>
@@ -212,7 +212,7 @@ export function Welcome() {
       <section className="landing-section landing-difference" id="why-sourcepilot" aria-labelledby="difference-title">
         <div className="landing-section-heading">
           <h2 id="difference-title">More useful than a one-off scrape.</h2>
-          <p>The value is in what happens after collection: a stable structure, a source trail, and a dataset you can return to.</p>
+          <p>The value is in what happens after a run: a stable structure, a source trail, and records you can return to.</p>
         </div>
         <div className="landing-feature-grid">
           <BeamCard className="beam-feature beam-feature-evidence" theme="dark">
@@ -233,7 +233,7 @@ export function Welcome() {
           <BeamCard className="beam-feature beam-feature-schema">
           <article className="landing-feature landing-feature-schema">
             <h3>Your fields, your call.</h3>
-            <p>The generated plan is a draft. You approve the typed fields and identity rules before collection begins.</p>
+            <p>The generated plan is a draft. You approve the typed fields and identity rules before the first run.</p>
             <div className="schema-tags" aria-label="Example field types">
               <span>title · text</span><span>deadline · date</span><span>region · text</span>
             </div>
@@ -242,7 +242,7 @@ export function Welcome() {
           <BeamCard className="beam-feature beam-feature-history">
           <article className="landing-feature landing-feature-history">
             <h3>Set it once. Let it rerun.</h3>
-            <p>Choose a daily or weekly schedule. Each due run adds new observations to the same dataset, with run history intact.</p>
+            <p>Choose a daily or weekly schedule. Each due run updates the records, with run history intact.</p>
             <BeamCard className="beam-rerun-flow" subtle>
             <div className="rerun-flow" aria-label="Daily or weekly schedule starts the next run and updates the dataset">
               <div><span>Schedule</span><strong>Daily / weekly</strong></div>
@@ -264,7 +264,7 @@ export function Welcome() {
         <div className="compare-list">
           <div><span>Setup</span><p>Describe the request and approve a plan instead of building a separate scraper for every question.</p></div>
           <div><span>Confidence</span><p>Review source-backed records instead of losing the evidence in a spreadsheet export.</p></div>
-          <div><span>Follow-up</span><p>Rerun an approved workflow instead of rebuilding the same collection process next week.</p></div>
+          <div><span>Follow-up</span><p>Run an approved event again to refresh its records next week.</p></div>
         </div>
       </section>
 
@@ -306,10 +306,15 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+  const [notificationPermission, setNotificationPermission] = useState(
+    typeof Notification === "undefined" ? "unsupported" : Notification.permission,
+  );
   const [query, setQuery] = useState("");
   const [filterField, setFilterField] = useState("");
   const [filterValue, setFilterValue] = useState("");
   const [approval, setApproval] = useState<Workflow | null>(null);
+  const [runPromptId, setRunPromptId] = useState<string | null>(null);
   const [usage, setUsage] = useState<{
     model: { used: number; limit: number };
     firecrawl: { used: number; limit: number };
@@ -370,16 +375,17 @@ export default function App() {
     if (organization) void refresh();
   }, [organization, refresh]);
   useEffect(() => {
-    if (!source && !runDetails) return;
+    if (!source && !runDetails && !runPromptId) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setSource(null);
         setRunDetails(null);
+        setRunPromptId(null);
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [source, runDetails]);
+  }, [source, runDetails, runPromptId]);
   useEffect(() => {
     if (!selectedId) {
       setRuns([]);
@@ -396,6 +402,18 @@ export default function App() {
           ),
         ]);
         if (active) {
+          for (const run of nextRuns) {
+            if (!run.recovery_count) continue;
+            const key = `sourcepilot:recovery:${run.id}`;
+            const notified = Number(window.localStorage.getItem(key) || 0);
+            if (run.recovery_count <= notified) continue;
+            window.localStorage.setItem(key, String(run.recovery_count));
+            const message = `Run resumed after a rate limit (${run.observations} records found so far).`;
+            setRecoveryNotice(message);
+            if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+              new Notification("SourcePilot run resumed", { body: message });
+            }
+          }
           setRuns(nextRuns);
           setRecords(nextRecords);
         }
@@ -412,6 +430,11 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [selectedId, query, filterField, filterValue, request]);
+  useEffect(() => {
+    if (!recoveryNotice) return;
+    const timeout = window.setTimeout(() => setRecoveryNotice(null), 10000);
+    return () => window.clearTimeout(timeout);
+  }, [recoveryNotice]);
 
   const selected = workflows.find((item) => item.id === selectedId);
   const canManage =
@@ -458,7 +481,18 @@ export default function App() {
           identity_fields: approval.identity_fields,
         }),
       });
+      setRunPromptId(approval.id);
       setApproval(null);
+    });
+  }
+
+  async function startRun(workflowId: string) {
+    await act(async () => {
+      const run = await request<Run>(`/api/workflows/${workflowId}/runs`, {
+        method: "POST",
+      });
+      setRuns((previous) => [run, ...previous]);
+      setRunPromptId(null);
     });
   }
 
@@ -499,6 +533,12 @@ export default function App() {
 
   return (
     <>
+      {recoveryNotice && (
+        <div className="recovery-toast" role="alert">
+          <div><strong>Run resumed</strong><span>{recoveryNotice}</span></div>
+          <button onClick={() => setRecoveryNotice(null)} aria-label="Dismiss notification">×</button>
+        </div>
+      )}
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
@@ -510,15 +550,16 @@ export default function App() {
             <span className="org-dot" />
             {organization.name}
           </div>
-          <div className="sidebar-caption sidebar-group">COLLECTIONS</div>
+          <div className="sidebar-caption sidebar-group">EVENTS</div>
           <button
             className={`nav-item ${!selectedId ? "active" : ""}`}
             onClick={() => {
               setSelectedId(null);
               setApproval(null);
+              setRunPromptId(null);
             }}
           >
-            ＋ &nbsp; New collection
+            ＋ &nbsp; New event
           </button>
           <div className="workflow-nav">
             {workflows.map((item) => (
@@ -528,6 +569,7 @@ export default function App() {
                 onClick={() => {
                   setSelectedId(item.id);
                   setApproval(item.status === "draft" ? item : null);
+                  setRunPromptId(null);
                   setView("overview");
                 }}
               >
@@ -554,7 +596,7 @@ export default function App() {
             <div className="breadcrumb">
               <img className="title-icon" src="/sourcepilot-icon.png" alt="" />
               <span className="title-name">SourcePilot</span>
-              <span>/</span> {selected?.title ?? "New collection"}
+              <span>/</span> {selected?.title ?? "New event"}
             </div>
             <div className="topbar-right">
               <span className="topbar-dot" /> Shared organization data
@@ -576,16 +618,16 @@ export default function App() {
           ) : approval ? (
             <div className="content narrow">
               <div className="eyebrow">STEP 02 / REVIEW THE PLAN</div>
-              <h1>Shape your dataset.</h1>
+              <h1>Choose your record fields.</h1>
               <p className="intro">
                 Review the proposed searches and fields. The schema locks when
-                the first run begins. You can clone the collection later to
+                the first run begins. You can duplicate the event later to
                 change it.
               </p>
               <BeamCard className="beam-form">
               <div className="panel form-panel">
                 <label>
-                  Collection name
+                  Event name
                   <input
                     value={approval.title}
                     maxLength={160}
@@ -615,7 +657,7 @@ export default function App() {
                   </label>
                 ))}
                 <h2>
-                  Dataset fields <span>Select at least one identity field</span>
+                  Record fields <span>Select at least one identity field</span>
                 </h2>
                 <div className="field-head">
                   <span>FIELD</span>
@@ -747,7 +789,7 @@ export default function App() {
                     onClick={() => void approve()}
                   >
                     {busy && <LoadingOrb state="connecting" theme="dark" />}
-                    {busy ? "Starting…" : "Approve & start collection"}{" "}
+                    {busy ? "Saving…" : "Save event"}{" "}
                     {!busy && <span aria-hidden>→</span>}
                   </button>
                 </div>
@@ -756,7 +798,7 @@ export default function App() {
             </div>
           ) : !selected ? (
             <div className="content new-content">
-              <div className="eyebrow">NEW COLLECTION</div>
+              <div className="eyebrow">NEW EVENT</div>
               <h1>What do you need to know?</h1>
               <p className="intro">
                 Describe the information you need from public web pages. We’ll
@@ -784,7 +826,7 @@ export default function App() {
                   <span>Public sources only · Up to 12 pages per run</span>
                   <button className="primary" disabled={drafting}>
                     {drafting && <LoadingOrb state="shaping" theme="dark" />}
-                    {drafting ? "Designing fields…" : "Design collection"}{" "}
+                    {drafting ? "Designing fields…" : "Create event"}{" "}
                     {!drafting && <span aria-hidden>→</span>}
                   </button>
                 </div>
@@ -813,7 +855,7 @@ export default function App() {
               <div className="page-heading">
                 <div>
                   <div className="eyebrow">
-                    COLLECTION / {selected.status.toUpperCase()}
+                    EVENT / {selected.status.toUpperCase()}
                   </div>
                   <h1>{selected.title}</h1>
                   <p>{selected.prompt}</p>
@@ -830,11 +872,24 @@ export default function App() {
               </div>
               {selected.pause_reason && (
                 <div className="notice" role="status">
-                  <b>Collection paused</b>
+                  <b>Run paused</b>
                   <span>
-                    {selected.pause_reason}. Scheduled work will retry when the
-                    service or quota becomes available.
+                    {selected.pause_reason}.
+                    {runs.find((run) => run.status === "paused" && run.next_retry_at)
+                      ? ` Next retry ${formatDate(runs.find((run) => run.status === "paused" && run.next_retry_at)!.next_retry_at)}.`
+                      : " Automatic retries will resume when the service or quota becomes available."}
                   </span>
+                </div>
+              )}
+              {selected.status === "active" && runs.length === 0 && canManage && (
+                <div className="ready-notice" role="status">
+                  <div>
+                    <b>Your event is ready</b>
+                    <span>Start the first run whenever you’re ready.</span>
+                  </div>
+                  <button className="primary" disabled={busy} onClick={() => void startRun(selected.id)}>
+                    {busy ? "Starting…" : "Run now"}
+                  </button>
                 </div>
               )}
               <div className="tabs">
@@ -858,12 +913,12 @@ export default function App() {
                     <div className="stat-card">
                       <span>RECORDS IN VIEW</span>
                       <strong>{records.length}</strong>
-                      <small>Cumulative dataset</small>
+                      <small>Across all runs</small>
                     </div>
                     </BeamCard>
                     <BeamCard className="beam-stat">
                     <div className="stat-card">
-                      <span>COLLECTION RUNS</span>
+                      <span>RUNS</span>
                       <strong>{runs.length}</strong>
                       <small>History retained</small>
                     </div>
@@ -878,7 +933,7 @@ export default function App() {
                       </strong>
                       <small>
                         {selected.cadence === "none"
-                          ? "Manual collection"
+                          ? "Manual runs"
                           : `${selected.cadence} · ${selected.timezone}`}
                       </small>
                     </div>
@@ -886,22 +941,26 @@ export default function App() {
                   </div>
                   <div className="section-heading">
                     <div>
-                      <h2>Collection activity</h2>
+                      <h2>Run activity</h2>
                       <p>Monitor progress and inspect failures.</p>
                     </div>
-                    {canManage && selected.status === "active" && (
+                    {notificationPermission === "default" && (
                       <button
                         className="secondary"
-                        disabled={busy}
-                        onClick={() =>
-                          void act(() =>
-                            request(`/api/workflows/${selected.id}/runs`, {
-                              method: "POST",
-                            }),
-                          )
-                        }
+                        onClick={() => {
+                          void Notification.requestPermission().then(setNotificationPermission);
+                        }}
                       >
-                        ↻ &nbsp; Run now
+                        Enable desktop alerts
+                      </button>
+                    )}
+                    {canManage && selected.status === "active" && runs.length > 0 && (
+                      <button
+                        className="secondary"
+                        disabled={busy || runs.some((run) => ["queued", "running", "paused"].includes(run.status))}
+                        onClick={() => void startRun(selected.id)}
+                      >
+                        ↻ &nbsp; {runs.some((run) => ["queued", "running", "paused"].includes(run.status)) ? "Run pending" : "Run now"}
                       </button>
                     )}
                   </div>
@@ -923,9 +982,11 @@ export default function App() {
                               <span>· {run.trigger}</span>
                             </b>
                             <small>
-                              {run.pause_reason ||
+                              {run.pause_reason
+                                ? `${run.pause_reason}${run.next_retry_at ? ` · Next retry ${formatDate(run.next_retry_at)}` : ""}`
+                                :
                                 run.error ||
-                                `${run.stage} · ${run.searched} searches · ${run.scraped} pages · ${run.observations} observations`}
+                                `${run.stage} · ${run.searched} searches · ${run.scraped} pages · ${run.observations} records found`}
                             </small>
                           </div>
                           <time>{formatDate(run.created_at)}</time>
@@ -944,7 +1005,7 @@ export default function App() {
                                 onClick={() => {
                                   if (
                                     window.confirm(
-                                      "Cancel this collection run?",
+                                      "Cancel this run?",
                                     )
                                   )
                                     void act(() =>
@@ -978,7 +1039,7 @@ export default function App() {
                       ))
                     ) : (
                       <div className="empty-state">
-                        No runs yet. Approve this collection to begin.
+                        No runs yet. Start one when you're ready.
                       </div>
                     )}
                   </div>
@@ -986,7 +1047,7 @@ export default function App() {
                   <div className="section-heading">
                     <div>
                       <h2>Schedule</h2>
-                      <p>Repeat the approved collection automatically.</p>
+                      <p>Repeat this event automatically.</p>
                     </div>
                   </div>
                   <BeamCard className="beam-panel">
@@ -1029,7 +1090,7 @@ export default function App() {
                 <>
                   <div className="section-heading">
                     <div>
-                      <h2>Dataset</h2>
+                      <h2>Records</h2>
                       <p>
                         Search, filter, inspect evidence, or export all records.
                       </p>
@@ -1131,6 +1192,22 @@ export default function App() {
             </div>
           )}
         </main>
+        {runPromptId && (
+          <div className="run-prompt-backdrop">
+            <section className="run-prompt" role="dialog" aria-modal="true" aria-labelledby="run-prompt-title">
+              <div className="eyebrow">EVENT SAVED</div>
+              <h2 id="run-prompt-title">Ready to run your event?</h2>
+              <p>Start a run to search public pages and add matching results to Records.</p>
+              {error && <p role="alert">{error}</p>}
+              <div className="run-prompt-actions">
+                <button className="secondary" onClick={() => setRunPromptId(null)}>I'll run it later</button>
+                <button className="primary" autoFocus disabled={busy} onClick={() => void startRun(runPromptId)}>
+                  {busy ? "Starting…" : "Run now"}
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
         {source && (
           <div className="drawer-backdrop">
             <aside
@@ -1179,12 +1256,12 @@ export default function App() {
               >
                 ×
               </button>
-              <div className="eyebrow">COLLECTION RUN</div>
+              <div className="eyebrow">RUN DETAILS</div>
               <h2>{statusLabel(runDetails.status)}</h2>
               <p>
                 {runDetails.pause_reason ||
                   runDetails.error ||
-                  "Collection progress and source counts."}
+                  "Run progress and source counts."}
               </p>
               <dl>
                 <dt>STAGE</dt>
@@ -1199,7 +1276,7 @@ export default function App() {
                 <dd>{runDetails.searched}</dd>
                 <dt>PAGES</dt>
                 <dd>{runDetails.scraped}</dd>
-                <dt>OBSERVATIONS</dt>
+                <dt>RECORDS FOUND</dt>
                 <dd>{runDetails.observations}</dd>
               </dl>
             </aside>

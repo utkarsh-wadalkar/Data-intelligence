@@ -98,6 +98,9 @@ def run_json(run: Run) -> dict:
                 "searched",
                 "scraped",
                 "observations",
+                "retry_attempt",
+                "next_retry_at",
+                "recovery_count",
                 "cancel_requested",
                 "created_at",
                 "started_at",
@@ -184,7 +187,6 @@ def get_workflow(
 def approve(
     workflow_id: str,
     body: ApproveRequest,
-    background: BackgroundTasks,
     principal: Principal = Depends(get_principal),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -198,9 +200,7 @@ def approve(
     workflow.identity_fields = body.identity_fields
     workflow.status = "active"
     db.commit()
-    run = enqueue_run(db, workflow, "approval", "approval")
-    dispatch(run.id, background)
-    return {"workflow": workflow_json(workflow), "run": run_json(run)}
+    return {"workflow": workflow_json(workflow), "run": None}
 
 
 @app.post("/api/workflows/{workflow_id}/clone", status_code=201)
@@ -257,6 +257,14 @@ def rerun(
     require_owner(principal, workflow.creator_id)
     if workflow.status != "active":
         raise HTTPException(409, "Approve fields before running")
+    active_run = db.scalar(
+        select(Run.id).where(
+            Run.workflow_id == workflow.id,
+            Run.status.in_(["queued", "running", "paused"]),
+        )
+    )
+    if active_run:
+        raise HTTPException(409, "This event already has a run in progress or awaiting retry")
     run = enqueue_run(db, workflow, "manual", f"manual:{uuid4()}")
     dispatch(run.id, background)
     return run_json(run)

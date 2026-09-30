@@ -21,6 +21,14 @@ from .providers import (
 from .quotas import QuotaExceeded, consume
 from .scheduling import enqueue_run, next_due
 
+RATE_LIMIT_DELAYS = (1, 3, 5, 10, 30, 120, 300, 1440)
+
+
+def is_openrouter_rate_limit(reason: str) -> bool:
+    return reason.startswith("OpenRouter rate limit reached") or (
+        "openrouter.ai" in reason and "429 Too Many Requests" in reason
+    )
+
 
 def claim(db: Session, run_id: str) -> bool:
     run = db.get(Run, run_id)
@@ -48,7 +56,7 @@ def claim(db: Session, run_id: str) -> bool:
     changed = db.execute(
         update(Run)
         .where(Run.id == run.id, Run.status == "queued")
-        .values(status="running", stage="searching", started_at=now)
+        .values(status="running", stage="searching", started_at=now, next_retry_at=None)
     )
     if changed.rowcount != 1:
         db.rollback()
@@ -156,63 +164,113 @@ def process_run(run_id: str) -> None:
         workflow = db.get(Workflow, run.workflow_id)
         deadline = time.monotonic() + 600
         try:
-            seen_urls: set[str] = set()
             ensure_search_ready()
             ensure_model_ready()
-            for query in workflow.queries[:3]:
+            checkpoint = run.checkpoint or {
+                "query_index": max(0, run.searched - 1) if run.searched else 0,
+                "hits": [],
+                "hit_index": 0,
+                "seen_urls": [],
+                "page": None,
+                "source_id": None,
+            }
+            if run.checkpoint is None:
+                run.checkpoint = dict(checkpoint)
+                db.commit()
+            while checkpoint["query_index"] < min(3, len(workflow.queries)):
                 db.refresh(run)
                 if time.monotonic() >= deadline or run.cancel_requested:
                     break
-                if run.searched >= 3:
-                    raise QuotaExceeded("Per-run limit of three searches reached")
-                # Firecrawl charges two credits for a search of up to ten results.
-                consume(db, run.org_id, "firecrawl", 2)
-                # Reserve the attempt before the provider call so a failed call or
-                # recovered worker cannot exceed the per-run search limit.
-                run.searched += 1
-                db.commit()
-                found = search(query)
+                if not checkpoint["hits"] and checkpoint["hit_index"] == 0:
+                    if run.searched >= 3:
+                        raise QuotaExceeded("Per-run limit of three searches reached")
+                    # Reserve the search before calling Firecrawl, including failed calls.
+                    consume(db, run.org_id, "firecrawl", 2)
+                    run.searched += 1
+                    db.commit()
+                    found = search(workflow.queries[checkpoint["query_index"]])
+                    checkpoint["hits"] = found
+                    run.checkpoint = dict(checkpoint)
+                    db.commit()
                 run.stage = "scraping"
                 db.commit()
-                for hit in found:
+                while checkpoint["hit_index"] < len(checkpoint["hits"]):
                     db.refresh(run)
                     if (
-                        run.scraped >= 12
+                        (run.scraped >= 12 and not checkpoint["page"])
                         or run.observations >= 100
                         or time.monotonic() >= deadline
                         or run.cancel_requested
                     ):
                         break
+                    hit = checkpoint["hits"][checkpoint["hit_index"]]
                     url = hit.get("url", "") if isinstance(hit, dict) else ""
-                    if not public_url(url) or url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    consume(db, run.org_id, "firecrawl")
-                    try:
-                        title, page = scrape(url)
-                    except ProviderUnavailable as exc:
-                        if "skipped" in str(exc):
+                    if not checkpoint["page"]:
+                        if not public_url(url) or url in checkpoint["seen_urls"]:
+                            checkpoint["hit_index"] += 1
+                            run.checkpoint = dict(checkpoint)
+                            db.commit()
                             continue
-                        raise
-                    source = Source(
-                        org_id=run.org_id,
-                        run_id=run.id,
-                        url=url,
-                        title=title,
-                        excerpt=" ".join(page.split())[:400],
-                        fetched_at=utcnow(),
-                    )
-                    db.add(source)
-                    run.scraped += 1
+                        consume(db, run.org_id, "firecrawl")
+                        try:
+                            title, page = scrape(url)
+                        except ProviderUnavailable as exc:
+                            if "skipped" in str(exc):
+                                checkpoint["seen_urls"].append(url)
+                                checkpoint["hit_index"] += 1
+                                run.checkpoint = dict(checkpoint)
+                                db.commit()
+                                continue
+                            raise
+                        source = Source(
+                            org_id=run.org_id,
+                            run_id=run.id,
+                            url=url,
+                            title=title,
+                            excerpt=" ".join(page.split())[:400],
+                            fetched_at=utcnow(),
+                        )
+                        db.add(source)
+                        db.flush()
+                        checkpoint["page"] = page
+                        checkpoint["source_id"] = source.id
+                        checkpoint["seen_urls"].append(url)
+                        run.scraped += 1
+                        run.checkpoint = dict(checkpoint)
+                        db.commit()
+                    page = checkpoint["page"]
+                    source = db.get(Source, checkpoint["source_id"])
                     run.stage = "extracting"
                     db.commit()
                     consume(db, run.org_id, "model")
-                    for item in extract(page, workflow.fields):
+                    items = extract(page, workflow.fields)
+                    if run.retry_attempt:
+                        run.recovery_count += 1
+                        run.retry_attempt = 0
+                        db.commit()
+                    for item in items:
                         if run.observations >= 100 or run.cancel_requested:
                             break
                         if store_observation(db, workflow, run, source, item, page):
                             run.observations += 1
                             db.commit()
+                    checkpoint["page"] = None
+                    checkpoint["source_id"] = None
+                    checkpoint["hit_index"] += 1
+                    run.checkpoint = dict(checkpoint)
+                    db.commit()
+                if (
+                    checkpoint["hit_index"] < len(checkpoint["hits"])
+                    or run.scraped >= 12
+                    or run.observations >= 100
+                    or run.cancel_requested
+                    or time.monotonic() >= deadline
+                ):
+                    break
+                checkpoint["query_index"] += 1
+                checkpoint["hits"] = []
+                checkpoint["hit_index"] = 0
+                run.checkpoint = dict(checkpoint)
                 run.stage = "searching"
                 db.commit()
             db.refresh(run)
@@ -220,6 +278,7 @@ def process_run(run_id: str) -> None:
             run.stage = run.status
             run.finished_at = utcnow()
             workflow.pause_reason = None
+            run.checkpoint = None
         except (QuotaExceeded, ProviderUnavailable) as exc:
             db.rollback()
             run = db.get(Run, run_id)
@@ -228,6 +287,12 @@ def process_run(run_id: str) -> None:
             run.stage = "paused"
             run.pause_reason = str(exc)
             workflow.pause_reason = str(exc)
+            if is_openrouter_rate_limit(run.pause_reason):
+                run.retry_attempt += 1
+                delay = RATE_LIMIT_DELAYS[min(run.retry_attempt - 1, len(RATE_LIMIT_DELAYS) - 1)]
+                run.next_retry_at = utcnow() + timedelta(minutes=delay)
+            elif run.pause_reason != "Per-run limit of three searches reached":
+                run.next_retry_at = utcnow() + timedelta(hours=1)
         except Exception as exc:
             db.rollback()
             run = db.get(Run, run_id)
@@ -241,7 +306,7 @@ def process_run(run_id: str) -> None:
 
 
 def tick() -> list[str]:
-    """Hourly scheduler and recovery pass. Dispatch is performed after the transaction."""
+    """Minute scheduler and recovery pass. Dispatch is performed after the transaction."""
     created: list[str] = []
     with SessionLocal() as db:
         now = utcnow()
@@ -289,20 +354,24 @@ def tick() -> list[str]:
             )
             db.commit()
             created.append(run.id)
-        # Paused runs retain their identifiers and observations. Retry only on a later tick;
-        # provider and quota checks will pause them again with a visible reason if needed.
+        # Paused runs retain their identifiers and checkpointed provider work.
         for run in db.scalars(select(Run).where(Run.status == "paused")).all():
             if run.pause_reason == "Per-run limit of three searches reached":
                 continue
-            reason = run.pause_reason or ""
-            if (
-                reason.startswith("OpenRouter rate limit reached")
-                or ("openrouter.ai" in reason and "429 Too Many Requests" in reason)
-            ) and run.started_at and now - run.started_at < timedelta(days=1):
+            if is_openrouter_rate_limit(run.pause_reason or "") and run.retry_attempt == 0:
+                # Count the pre-migration 429 as the first failed attempt.
+                run.retry_attempt = 1
+            if run.next_retry_at is None:
+                # Existing paused runs predate the staged-retry migration.
+                delay = 1 if is_openrouter_rate_limit(run.pause_reason or "") else 60
+                run.next_retry_at = now + timedelta(minutes=delay)
+                continue
+            if run.next_retry_at > now:
                 continue
             run.status = "queued"
             run.stage = "retrying"
             run.pause_reason = None
+            run.next_retry_at = None
         db.commit()
         created.extend(db.scalars(select(Run.id).where(Run.status == "queued")).all())
     return list(dict.fromkeys(created))

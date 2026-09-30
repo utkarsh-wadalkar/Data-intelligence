@@ -1055,6 +1055,60 @@ select:focus-visible {
 .notice span {
   line-height: 1.4;
 }
+.ready-notice {
+  margin-top: 18px;
+  padding: 18px 20px;
+  border: 1px solid #c6dfcb;
+  border-radius: 12px;
+  background: #eef8ee;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  color: #24543a;
+}
+.ready-notice div { display: grid; gap: 4px; }
+.ready-notice span { font-size: 13px; }
+.run-prompt-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #1d342880;
+}
+.run-prompt {
+  width: min(460px, 100%);
+  padding: 32px;
+  border-radius: 16px;
+  background: #f9faf7;
+  box-shadow: 0 20px 60px #1e352344;
+}
+.run-prompt h2 { margin: 14px 0 8px; font-size: 28px; }
+.run-prompt p { color: #607769; line-height: 1.5; }
+.run-prompt-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+@media (max-width: 600px) {
+  .ready-notice { align-items: stretch; flex-direction: column; }
+}
+.recovery-toast {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  max-width: min(380px, calc(100vw - 40px));
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  padding: 16px 18px;
+  border: 1px solid #a9d4b8;
+  border-radius: 12px;
+  background: #eaf8ef;
+  box-shadow: 0 12px 32px #183d2833;
+  color: #184b2c;
+}
+.recovery-toast div { display: grid; gap: 4px; }
+.recovery-toast button { border: 0; background: none; color: inherit; cursor: pointer; font-size: 22px; }
 .tabs {
   margin-top: 32px;
   border-bottom: 1px solid #e0e7dd;
