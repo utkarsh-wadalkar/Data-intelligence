@@ -318,7 +318,7 @@ export default function App() {
   const [usage, setUsage] = useState<{
     model: { used: number; limit: number };
     web: { used: number; limit: number };
-  } | null>(null);
+  } | null | undefined>(undefined);
 
   const request = useCallback(
     async <T,>(path: string, init?: RequestInit): Promise<T> => {
@@ -354,7 +354,7 @@ export default function App() {
     try {
       const [items, limits] = await Promise.all([
         request<Workflow[]>("/api/workflows"),
-        request<typeof usage>("/api/usage"),
+        request<NonNullable<typeof usage>>("/api/usage").catch(() => null),
       ]);
       setWorkflows(items);
       setUsage(limits);
@@ -581,9 +581,9 @@ export default function App() {
           <div className="sidebar-bottom">
             <span>Included usage</span>
             <small>
-              {usage
+              {usage?.model && usage?.web
                 ? `${usage.model.used}/${usage.model.limit} AI calls today · ${usage.web.used}/${usage.web.limit} web requests this month`
-                : "Loading usage…"}
+                : usage === undefined ? "Loading usage…" : "Usage unavailable"}
             </small>
             <div className="account">
               <OrganizationSwitcher hidePersonal />
