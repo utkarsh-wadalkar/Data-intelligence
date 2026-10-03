@@ -16,9 +16,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data-intelligence.db"
     clerk_jwks_url: str = ""
     clerk_issuer: str = ""
-    clerk_organization_id: str = ""
     openrouter_api_key: str = ""
-    firecrawl_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
     model_provider: str = "openrouter"
     allow_paid_providers: bool = False

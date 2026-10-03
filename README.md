@@ -49,7 +49,7 @@ The dashboard shows run stages, search/page/observation counts, quota usage, and
 
 Creators or organization admins can start a manual run or choose a daily/weekly schedule with a local hour and timezone. A Modal job checks every minute for due work and eligible retries; execution is best effort after the scheduled time. Paused runs retain their run ID and checkpoint so the worker can resume unfinished provider work. See [`backend/app/scheduling.py`](backend/app/scheduling.py) and [`backend/modal_app.py`](backend/modal_app.py).
 
-The first release uses one shared Clerk organization. Members can view and export its data. A workflow's creator or an organization admin can manage its schedule and runs.
+SourcePilot accepts any active organization in a verified Clerk session and keeps each organization's data separate. Members can view and export their organization's data. A workflow's creator or an organization admin can manage its schedule and runs.
 
 ## Stack
 
@@ -73,7 +73,7 @@ Copy-Item backend/.env.example backend/.env
 Copy-Item frontend/.env.example frontend/.env.local
 ```
 
-Fill in `backend/.env` with `DATABASE_URL`, `CLERK_ISSUER`, `CLERK_JWKS_URL`, `CLERK_ORGANIZATION_ID`, `FIRECRAWL_API_KEY`, and `OPENROUTER_API_KEY`. Use a TiDB `mysql+pymysql://` URL with TLS certificate and identity checks. Keep `ALLOW_PAID_PROVIDERS=false`, `DISPATCH_MODE=local`, and `FRONTEND_ORIGIN=http://localhost:3000`. Set the **public** `VITE_CLERK_PUBLISHABLE_KEY` in `frontend/.env.local`; its `VITE_API_BASE_URL` should be `http://localhost:8000`. Never put backend keys in `VITE_*` variables or commit `.env` files.
+Fill in `backend/.env` with `DATABASE_URL`, `CLERK_ISSUER`, `CLERK_JWKS_URL`, `FIRECRAWL_API_KEY`, and `OPENROUTER_API_KEY`. Use a TiDB `mysql+pymysql://` URL with TLS certificate and identity checks. Keep `ALLOW_PAID_PROVIDERS=false`, `DISPATCH_MODE=local`, and `FRONTEND_ORIGIN=http://localhost:3000`. Set the **public** `VITE_CLERK_PUBLISHABLE_KEY` in `frontend/.env.local`; its `VITE_API_BASE_URL` should be `http://localhost:8000`. Never put backend keys in `VITE_*` variables or commit `.env` files.
 
 From the repository root, apply migrations and start the API:
 

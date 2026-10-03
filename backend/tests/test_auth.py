@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from app import auth
 
 
-def test_clerk_session_membership_and_admin(monkeypatch):
+def test_clerk_session_uses_active_organization_and_admin(monkeypatch):
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     monkeypatch.setattr(
         auth,
@@ -17,7 +17,6 @@ def test_clerk_session_membership_and_admin(monkeypatch):
         lambda: SimpleNamespace(
             clerk_jwks_url="https://clerk.example/jwks",
             clerk_issuer="https://clerk.example",
-            clerk_organization_id="org_one",
         ),
     )
     monkeypatch.setattr(
@@ -42,14 +41,16 @@ def test_clerk_session_membership_and_admin(monkeypatch):
         )
 
     principal = auth.get_principal(f"Bearer {token('org_one', 'admin')}")
-    assert principal.user_id == "user_one" and principal.is_admin
+    assert principal.user_id == "user_one" and principal.org_id == "org_one" and principal.is_admin
+    other = auth.get_principal(f"Bearer {token('org_two', 'member')}")
+    assert other.org_id == "org_two" and not other.is_admin
     assert auth.get_principal(f"Bearer {token('org_one', 'admin', 20)}").is_admin
     with pytest.raises(HTTPException) as too_early:
         auth.get_principal(f"Bearer {token('org_one', 'admin', 120)}")
     assert too_early.value.status_code == 401
-    with pytest.raises(HTTPException) as denied:
-        auth.get_principal(f"Bearer {token('org_two', 'admin')}")
-    assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as missing_org:
+        auth.get_principal(f"Bearer {token('', 'member')}")
+    assert missing_org.value.status_code == 403
     with pytest.raises(HTTPException) as invalid:
         auth.get_principal("Bearer not-a-token")
     assert invalid.value.status_code == 401

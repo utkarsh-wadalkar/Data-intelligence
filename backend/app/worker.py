@@ -184,8 +184,8 @@ def process_run(run_id: str) -> None:
                 if not checkpoint["hits"] and checkpoint["hit_index"] == 0:
                     if run.searched >= 3:
                         raise QuotaExceeded("Per-run limit of three searches reached")
-                    # Reserve the search before calling Firecrawl, including failed calls.
-                    consume(db, run.org_id, "firecrawl", 2)
+                    # Count the search before calling the provider, including failed calls.
+                    consume(db, run.org_id, "web")
                     run.searched += 1
                     db.commit()
                     found = search(workflow.queries[checkpoint["query_index"]])
@@ -211,7 +211,7 @@ def process_run(run_id: str) -> None:
                             run.checkpoint = dict(checkpoint)
                             db.commit()
                             continue
-                        consume(db, run.org_id, "firecrawl")
+                        consume(db, run.org_id, "web")
                         try:
                             title, page = scrape(url)
                         except ProviderUnavailable as exc:

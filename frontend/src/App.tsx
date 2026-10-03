@@ -317,7 +317,7 @@ export default function App() {
   const [runPromptId, setRunPromptId] = useState<string | null>(null);
   const [usage, setUsage] = useState<{
     model: { used: number; limit: number };
-    firecrawl: { used: number; limit: number };
+    web: { used: number; limit: number };
   } | null>(null);
 
   const request = useCallback(
@@ -582,7 +582,7 @@ export default function App() {
             <span>Included usage</span>
             <small>
               {usage
-                ? `${usage.model.used}/${usage.model.limit} AI calls today · ${usage.firecrawl.used}/${usage.firecrawl.limit} source credits this month`
+                ? `${usage.model.used}/${usage.model.limit} AI calls today · ${usage.web.used}/${usage.web.limit} web requests this month`
                 : "Loading usage…"}
             </small>
             <div className="account">

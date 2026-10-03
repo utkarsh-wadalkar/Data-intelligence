@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from .models import QuotaUsage
 
-LIMITS = {"model": 20, "firecrawl": 600}
+LIMITS = {"model": 20, "web": 600}
 
 
 class QuotaExceeded(Exception):

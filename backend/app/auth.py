@@ -18,7 +18,7 @@ class Principal:
 
 def get_principal(authorization: str | None = Header(default=None)) -> Principal:
     config = settings()
-    if not config.clerk_jwks_url or not config.clerk_issuer or not config.clerk_organization_id:
+    if not config.clerk_jwks_url or not config.clerk_issuer:
         raise HTTPException(503, "Clerk authentication is not configured")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Bearer token required")
@@ -36,11 +36,13 @@ def get_principal(authorization: str | None = Header(default=None)) -> Principal
     except jwt.PyJWTError as exc:
         logger.warning("Clerk session verification failed: %s", type(exc).__name__)
         raise HTTPException(401, "Invalid Clerk session") from exc
-    # Clerk's active organization claims are signed into its session JWT.
-    org_id = claims.get("org_id") or claims.get("o", {}).get("id")
-    role = claims.get("org_role") or claims.get("o", {}).get("rol", "")
-    if org_id != config.clerk_organization_id:
-        raise HTTPException(403, "Active membership in this organization is required")
+    # Use the signed active organization to scope data without pinning the demo to one ID.
+    organization = claims.get("o")
+    organization = organization if isinstance(organization, dict) else {}
+    org_id = claims.get("org_id") or organization.get("id")
+    role = claims.get("org_role") or organization.get("rol", "")
+    if not isinstance(org_id, str) or not org_id:
+        raise HTTPException(403, "Select an organization to continue")
     return Principal(str(claims["sub"]), org_id, role in {"org:admin", "admin"})
 
 

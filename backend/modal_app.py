@@ -17,8 +17,6 @@ REQUIRED_SECRET_FIELDS = (
     "DATABASE_URL",
     "CLERK_ISSUER",
     "CLERK_JWKS_URL",
-    "CLERK_ORGANIZATION_ID",
-    "FIRECRAWL_API_KEY",
     "OPENROUTER_API_KEY",
     "FRONTEND_ORIGIN",
 )
@@ -71,6 +69,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ca-certificates")
     .pip_install_from_pyproject("backend/pyproject.toml")
+    .run_commands("python -m playwright install --with-deps chromium")
     .workdir("/root")
     .add_local_dir("backend/app", remote_path="/root/app")
 )

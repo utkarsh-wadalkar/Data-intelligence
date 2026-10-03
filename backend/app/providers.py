@@ -1,9 +1,12 @@
+import asyncio
 import ipaddress
 import json
 import re
 from urllib.parse import urlparse
 
 import httpx
+from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
+from ddgs import DDGS
 from pydantic import ValidationError
 
 from .config import settings
@@ -27,8 +30,8 @@ def provider_error(response: httpx.Response) -> str:
 
 
 def ensure_search_ready() -> None:
-    if not settings().firecrawl_api_key:
-        raise ProviderUnavailable("Firecrawl free API key is missing")
+    # Search and crawling run locally and need no provider credentials.
+    return
 
 
 def ensure_model_ready() -> None:
@@ -191,83 +194,48 @@ def plan_prompt(prompt: str) -> ApproveRequest:
 
 
 def search(query: str) -> list[dict]:
-    key = settings().firecrawl_api_key
-    if not key:
-        raise ProviderUnavailable("Firecrawl free API key is missing")
     try:
-        response = httpx.post(
-            "https://api.firecrawl.dev/v2/search",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"query": query, "limit": 4, "sources": [{"type": "web"}]},
-            timeout=30,
+        return [
+            {"url": hit["href"], "title": hit.get("title", "")}
+            for hit in DDGS(timeout=30).text(query, max_results=4)
+            if isinstance(hit, dict) and isinstance(hit.get("href"), str)
+        ]
+    except Exception as exc:
+        raise ProviderUnavailable(f"Web search unavailable: {str(exc)[:200]}") from exc
+
+
+async def _crawl(url: str):
+    async with AsyncWebCrawler() as crawler:
+        return await crawler.arun(
+            url=url,
+            config=CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS, page_timeout=45000, check_robots_txt=True
+            ),
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("success") is False:
-            raise ProviderUnavailable(
-                f"Firecrawl search unavailable: {str(payload.get('error', 'unknown error'))[:200]}"
-            )
-        data = payload.get("data", {})
-        return data.get("web", data) if isinstance(data, dict) else data
-    except (httpx.HTTPError, ValueError) as exc:
-        raise ProviderUnavailable(f"Firecrawl search unavailable: {str(exc)[:200]}") from exc
 
 
 def scrape(url: str) -> tuple[str, str]:
     if not public_url(url):
         raise ProviderUnavailable("Nonpublic source URL skipped")
-    key = settings().firecrawl_api_key
-    if not key:
-        raise ProviderUnavailable("Firecrawl free API key is missing")
     try:
-        response = httpx.post(
-            "https://api.firecrawl.dev/v2/scrape",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "url": url,
-                "formats": ["markdown"],
-                "proxy": "basic",
-                "onlyMainContent": True,
-            },
-            timeout=45,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("success") is False:
-            reason = str(payload.get("error", "unknown error"))[:200]
-            if re.search(
-                r"blocked|robots|login|paywall|access denied|"
-                r"do not support this site|website not supported",
-                reason,
-                re.I,
-            ):
-                raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
-            raise ProviderUnavailable(f"Firecrawl scrape unavailable: {reason}")
-        data = payload.get("data", {})
-        if data.get("metadata", {}).get("statusCode") in {401, 403, 404, 410}:
+        result = asyncio.run(_crawl(url))
+        if result.status_code in {401, 403, 404, 410}:
             raise ProviderUnavailable("Blocked or unavailable page skipped")
-        markdown = data.get("markdown", "")
+        if not result.success:
+            reason = str(result.error_message or "unknown error")[:200]
+            if re.search(r"blocked|robots|login|paywall|access denied", reason, re.I):
+                raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
+            raise ProviderUnavailable(f"Crawl4AI scrape unavailable: {reason}")
+        markdown = str(result.markdown or "")
         if not markdown or re.search(
             r"\b(sign in|log in|subscribe to read|paywall)\b", markdown[:1500], re.I
         ):
             raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
-        return str(data.get("metadata", {}).get("title", ""))[:300], markdown[:30000]
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code in {404, 410} or re.search(
-            r"blocked|robots|paywall|access denied|do not support this site|website not supported",
-            exc.response.text[:400],
-            re.I,
-        ):
-            raise ProviderUnavailable("Blocked or unavailable page skipped") from exc
-        reason = provider_error(exc.response)
-        if exc.response.status_code == 403 and reason == "HTTP 403":
-            reason = "Check Firecrawl API key permissions or plan access"
-        raise ProviderUnavailable(
-            f"Firecrawl scrape unavailable (HTTP {exc.response.status_code}): "
-            f"{reason}"
-        ) from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise ProviderUnavailable(f"Firecrawl scrape unavailable: {str(exc)[:200]}") from exc
+        return str((result.metadata or {}).get("title", ""))[:300], markdown[:30000]
+    except ProviderUnavailable:
+        raise
+    except Exception as exc:
+        raise ProviderUnavailable(f"Crawl4AI scrape unavailable: {str(exc)[:200]}") from exc
 
 
 def extract(page: str, fields: list[dict]) -> list[dict]:
