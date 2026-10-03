@@ -35,7 +35,7 @@ The user can edit the proposed searches, field names and types, and identity fie
 
 ### 3. Search and read public pages
 
-The worker submits each approved query to Firecrawl's `/v2/search` endpoint, requesting up to four web results per query. It skips duplicate or nonpublic URLs, then calls Firecrawl's `/v2/scrape` endpoint with **basic proxy**, Markdown output, and main-page content only. Blocked, login-only, paywalled, or unavailable pages are skipped. A run is bounded to **three searches and 12 successfully scraped pages**. For each scraped page, the model is asked for at most 20 candidate records in the approved shape, each with a short verbatim evidence excerpt. See [`backend/app/worker.py`](backend/app/worker.py) and [`backend/app/providers.py`](backend/app/providers.py).
+The worker searches each approved query with DDGS, requesting up to four web results. It skips duplicate or nonpublic URLs, then uses a local Crawl4AI browser to convert each page to Markdown. Browser requests are pinned to the validated public host, cross-host resources are blocked, page JavaScript is disabled, and `robots.txt` is checked for navigation targets. JavaScript-only pages may be skipped. Blocked, login-only, paywalled, or unavailable pages are skipped. A run is bounded to **three searches and 12 successfully scraped pages**. For each scraped page, the model is asked for at most 20 candidate records in the approved shape, each with a short verbatim evidence excerpt. See [`backend/app/worker.py`](backend/app/worker.py) and [`backend/app/providers.py`](backend/app/providers.py).
 
 ### 4. Check evidence and build a dataset that survives reruns
 
@@ -59,21 +59,22 @@ SourcePilot accepts any active organization in a verified Clerk session and keep
 | API and workers | FastAPI, Python; Modal web endpoint, workers, and minute scheduler |
 | Data | TiDB Cloud (MySQL protocol), SQLAlchemy 2, Alembic |
 | Authentication | Clerk Organizations and verified session JWTs |
-| Collection and extraction | Firecrawl `/v2/search` and `/v2/scrape`; OpenRouter `/api/v1/chat/completions` with `openrouter/free` and `qwen/qwen3.8-27b:free`, returning JSON validated locally |
+| Collection and extraction | DDGS keyless search and self hosted Crawl4AI; OpenRouter `/api/v1/chat/completions` with `openrouter/free` and `qwen/qwen3.8-27b:free`, returning JSON validated locally |
 
 ## Run locally (PowerShell)
 
-Requirements: Python 3.11+, Node.js with Corepack/pnpm, a TiDB database, a Clerk application and organization, and free Firecrawl and OpenRouter API keys.
+Requirements: Python 3.11+, Node.js with Corepack/pnpm, a TiDB database, a Clerk application and organization, and a free OpenRouter API key. Chromium is required for Crawl4AI.
 
 ```powershell
 python -m venv backend/.venv
 ./backend/.venv/Scripts/Activate.ps1
 pip install -e "./backend[test]"
+python -m playwright install chromium
 Copy-Item backend/.env.example backend/.env
 Copy-Item frontend/.env.example frontend/.env.local
 ```
 
-Fill in `backend/.env` with `DATABASE_URL`, `CLERK_ISSUER`, `CLERK_JWKS_URL`, `FIRECRAWL_API_KEY`, and `OPENROUTER_API_KEY`. Use a TiDB `mysql+pymysql://` URL with TLS certificate and identity checks. Keep `ALLOW_PAID_PROVIDERS=false`, `DISPATCH_MODE=local`, and `FRONTEND_ORIGIN=http://localhost:3000`. Set the **public** `VITE_CLERK_PUBLISHABLE_KEY` in `frontend/.env.local`; its `VITE_API_BASE_URL` should be `http://localhost:8000`. Never put backend keys in `VITE_*` variables or commit `.env` files.
+Fill in `backend/.env` with `DATABASE_URL`, `CLERK_ISSUER`, `CLERK_JWKS_URL`, and `OPENROUTER_API_KEY`. Use a TiDB `mysql+pymysql://` URL with TLS certificate and identity checks. Keep `ALLOW_PAID_PROVIDERS=false`, `DISPATCH_MODE=local`, and `FRONTEND_ORIGIN=http://localhost:3000`. Set the **public** `VITE_CLERK_PUBLISHABLE_KEY` in `frontend/.env.local`; its `VITE_API_BASE_URL` should be `http://localhost:8000`. Never put backend keys in `VITE_*` variables or commit `.env` files.
 
 From the repository root, apply migrations and start the API:
 
@@ -97,7 +98,7 @@ Open `http://localhost:3000`. Sign in with a member account and select the confi
 
 The frontend is hosted as a Render static site and the backend runs on Modal. Create a **named Modal Secret** called `data-intelligence` from a local `backend/.env.modal` based on `backend/.env.modal.example`. Set `DISPATCH_MODE=modal` and `FRONTEND_ORIGIN` to the exact Render origin, such as `https://sourcepilot.onrender.com`. The Modal `DATABASE_URL` must use a CA path available inside its Linux image, with `ssl_verify_cert=true&ssl_verify_identity=true`.
 
-Before cloud execution, manually verify TiDB Starter stays free, Modal's workspace out-of-pocket spend limit is **$0** with a usage budget below its monthly free credits, and Firecrawl/OpenRouter remain on free plans. Keep `ALLOW_PAID_PROVIDERS=false`. Only after those dashboard checks, set `SPEND_GUARDS_VERIFIED=true` in your local `backend/.env.modal` and update the Secret. Deployment is blocked while that flag is false.
+Before cloud execution, manually verify TiDB Starter stays free, Modal's workspace out-of-pocket spend limit is **$0** with a usage budget below its monthly free credits, and OpenRouter remains on a free plan. Keep `ALLOW_PAID_PROVIDERS=false`. Only after those dashboard checks, set `SPEND_GUARDS_VERIFIED=true` in your local `backend/.env.modal` and update the Secret. Deployment is blocked while that flag is false.
 
 ```powershell
 modal secret create data-intelligence --from-dotenv backend/.env.modal --force
@@ -108,7 +109,7 @@ Run `alembic upgrade head` manually from `backend/` against TiDB before deployme
 
 ## Cost and recovery limits
 
-Each run is limited to **3 searches, 12 scraped pages, 100 observations, and 10 minutes per execution attempt**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 Firecrawl credits per UTC month**. A search returning up to four results reserves two credits; each basic scrape reserves one. Provider or quota exhaustion pauses work with a visible reason. The minute scheduler dispatches queued work and resumes eligible paused runs using their existing run ID and saved checkpoint. After an OpenRouter 429, automatic retry delays increase through 1, 3, 5, 10, 30, 120, 300, and 1440 minutes; other provider or quota pauses retry after one hour, while the per-run search limit does not auto-retry. A manual retry creates a new run. SourcePilot does not route to paid models or enhanced proxies.
+Each run is limited to **3 searches, 12 scraped pages, 100 observations, and 10 minutes per execution attempt**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 web requests per UTC month**. Each search attempt and each page crawl attempt reserves one web request. Provider or quota exhaustion pauses work with a visible reason. The minute scheduler dispatches queued work and resumes eligible paused runs using their existing run ID and saved checkpoint. After an OpenRouter 429, automatic retry delays increase through 1, 3, 5, 10, 30, 120, 300, and 1440 minutes; other provider or quota pauses retry after one hour, while the per-run search limit does not auto-retry. A manual retry creates a new run. SourcePilot does not route to paid models or scraping providers.
 
 ## Checks
 

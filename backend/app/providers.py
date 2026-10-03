@@ -2,10 +2,13 @@ import asyncio
 import ipaddress
 import json
 import re
-from urllib.parse import urlparse
+import socket
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
+import aiohttp
 import httpx
-from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from ddgs import DDGS
 from pydantic import ValidationError
 
@@ -199,19 +202,140 @@ def search(query: str) -> list[dict]:
             {"url": hit["href"], "title": hit.get("title", "")}
             for hit in DDGS(timeout=30).text(query, max_results=4)
             if isinstance(hit, dict) and isinstance(hit.get("href"), str)
-        ]
+        ][:4]
     except Exception as exc:
         raise ProviderUnavailable(f"Web search unavailable: {str(exc)[:200]}") from exc
 
 
+async def resolve_host(host: str, port: int):
+    return await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+async def public_addresses(url: str) -> list[str]:
+    if not public_url(url):
+        return []
+    parsed = urlparse(url)
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname):
+        return []
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = await resolve_host(parsed.hostname, port)
+        resolved = list(dict.fromkeys(address[4][0] for address in addresses))
+        if resolved and all(ipaddress.ip_address(ip).is_global for ip in resolved):
+            return resolved
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+async def public_request_url(url: str) -> bool:
+    return bool(await public_addresses(url))
+
+
+class PublicResolver(aiohttp.abc.AbstractResolver):
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        addresses = await resolve_host(host, port)
+        if not addresses or any(
+            not ipaddress.ip_address(address[4][0]).is_global for address in addresses
+        ):
+            raise OSError("Nonpublic robots destination")
+        return [
+            {
+                "hostname": host,
+                "host": address[4][0],
+                "port": port,
+                "family": address[0],
+                "proto": address[2],
+                "flags": socket.AI_NUMERICHOST,
+            }
+            for address in addresses
+        ]
+
+    async def close(self) -> None:
+        pass
+
+
+async def guard_route(
+    route, blocked_navigation: list[str] | None = None, allowed_host: str | None = None
+) -> None:
+    url = route.request.url
+    navigation = route.request.is_navigation_request() if blocked_navigation is not None else False
+    if allowed_host is None:
+        permitted = await public_request_url(url)
+    else:
+        permitted = public_url(url) and urlparse(url).hostname == allowed_host
+        if permitted and navigation:
+            permitted = await robots_allowed(url)
+    if permitted:
+        await route.continue_()
+    else:
+        if blocked_navigation is not None and navigation:
+            blocked_navigation.append(url)
+        await route.abort()
+
+
+async def robots_allowed(url: str) -> bool:
+    parsed = urlparse(url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    try:
+        connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as client:
+            for _ in range(4):
+                if not await public_request_url(robots_url):
+                    raise ProviderUnavailable("Nonpublic robots redirect skipped")
+                async with client.get(robots_url, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ProviderUnavailable("Robots.txt redirect was invalid")
+                        robots_url = urljoin(robots_url, location)
+                        continue
+                    if response.status in {401, 403}:
+                        return False
+                    if response.status in {404, 410}:
+                        return True
+                    response.raise_for_status()
+                    parser = RobotFileParser()
+                    parser.parse((await response.text()).splitlines())
+                    return parser.can_fetch("*", url)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        raise ProviderUnavailable(f"Robots.txt unavailable: {str(exc)[:200]}") from exc
+    raise ProviderUnavailable("Robots.txt redirected too many times")
+
+
 async def _crawl(url: str):
-    async with AsyncWebCrawler() as crawler:
-        return await crawler.arun(
+    addresses = await public_addresses(url)
+    ip = next((address for address in addresses if ":" not in address), None)
+    if not ip:
+        raise ProviderUnavailable("Nonpublic source URL skipped")
+    if not await robots_allowed(url):
+        raise ProviderUnavailable("Blocked by robots.txt page skipped")
+    host = urlparse(url).hostname
+    browser_config = BrowserConfig(
+        java_script_enabled=False,
+        extra_args=[f"--host-resolver-rules=MAP {host} {ip}, MAP * ~NOTFOUND"],
+    )
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        blocked_navigation = []
+
+        async def on_page_context_created(page, context, **kwargs):
+            async def route_guard(route):
+                await guard_route(route, blocked_navigation, allowed_host=host)
+
+            await context.route("**", route_guard)
+            return page
+
+        crawler.crawler_strategy.set_hook("on_page_context_created", on_page_context_created)
+        result = await crawler.arun(
             url=url,
             config=CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS, page_timeout=45000, check_robots_txt=True
+                cache_mode=CacheMode.BYPASS, page_timeout=45000, check_robots_txt=False
             ),
         )
+        if blocked_navigation:
+            raise ProviderUnavailable("Nonpublic source URL skipped")
+        return result
 
 
 def scrape(url: str) -> tuple[str, str]:
@@ -227,9 +351,11 @@ def scrape(url: str) -> tuple[str, str]:
                 raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
             raise ProviderUnavailable(f"Crawl4AI scrape unavailable: {reason}")
         markdown = str(result.markdown or "")
-        if not markdown or re.search(
-            r"\b(sign in|log in|subscribe to read|paywall)\b", markdown[:1500], re.I
-        ):
+        access_wall = re.search(r"\b(subscribe to read|paywall)\b", markdown[:1500], re.I)
+        sparse_login = len(markdown) < 500 and re.search(
+            r"\b(sign in|log in)\b", markdown[:1500], re.I
+        )
+        if not markdown.strip() or access_wall or sparse_login:
             raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
         return str((result.metadata or {}).get("title", ""))[:300], markdown[:30000]
     except ProviderUnavailable:

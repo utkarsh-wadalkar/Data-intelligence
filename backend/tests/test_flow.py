@@ -111,6 +111,10 @@ def test_prompt_approval_collection_dedup_evidence_export(context, monkeypatch):
         ],
     )
     worker.process_run(run_id)
+    usage = client.get("/api/usage").json()
+    assert usage["web"]["used"] == 2
+    assert usage["web"]["limit"] == 600
+    assert "firecrawl" not in usage
     result = client.get(f"/api/workflows/{workflow_id}/records").json()
     assert len(result) == 1
     assert result[0]["evidence"] in page
@@ -135,6 +139,27 @@ def test_prompt_approval_collection_dedup_evidence_export(context, monkeypatch):
     assert "source_url" in csv_data and "https://example.com/jobs" in csv_data
     assert len(json_data) == 1 and json_data[0]["evidence"] in page
     assert client.get(f"/api/workflows/{workflow_id}/records?q=missing").json() == []
+
+
+def test_empty_search_advances_to_next_query(context, monkeypatch):
+    client, sessions, _ = context
+    workflow_id, run_id = make_approved(client)
+    with sessions() as db:
+        workflow = db.get(Workflow, workflow_id)
+        workflow.queries = ["empty query", "useful query"]
+        db.commit()
+    queries = []
+
+    def search(query):
+        queries.append(query)
+        return [] if query == "empty query" else [{"url": "https://example.com/jobs"}]
+
+    monkeypatch.setattr(worker, "search", search)
+    monkeypatch.setattr(worker, "scrape", lambda url: ("Jobs", "Public job listing"))
+    monkeypatch.setattr(worker, "extract", lambda page, fields: [])
+    worker.process_run(run_id)
+    assert queries == ["empty query", "useful query"]
+    assert client.get(f"/api/runs/{run_id}").json()["status"] == "completed"
 
 
 def test_unsupported_source_does_not_pause_collection(context, monkeypatch):
