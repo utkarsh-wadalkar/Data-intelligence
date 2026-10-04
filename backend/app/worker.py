@@ -22,6 +22,9 @@ from .quotas import QuotaExceeded, consume
 from .scheduling import enqueue_run, next_due
 
 RATE_LIMIT_DELAYS = (1, 3, 5, 10, 30, 120, 300, 1440)
+MAX_SCRAPED_PAGES = 16
+MAX_OBSERVATIONS = 200
+WORK_SLICE_SECONDS = 480
 
 
 def is_openrouter_rate_limit(reason: str) -> bool:
@@ -162,7 +165,7 @@ def process_run(run_id: str) -> None:
             return
         run = db.get(Run, run_id)
         workflow = db.get(Workflow, run.workflow_id)
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + WORK_SLICE_SECONDS
         try:
             ensure_search_ready()
             ensure_model_ready()
@@ -184,11 +187,15 @@ def process_run(run_id: str) -> None:
                 if not checkpoint["hits"] and checkpoint["hit_index"] == 0:
                     if run.searched >= 3:
                         raise QuotaExceeded("Per-run limit of three searches reached")
-                    # Count the search before calling the provider, including failed calls.
-                    consume(db, run.org_id, "web")
-                    run.searched += 1
-                    db.commit()
-                    found = search(workflow.queries[checkpoint["query_index"]])
+                    query = workflow.queries[checkpoint["query_index"]]
+                    if query.startswith(("http://", "https://")):
+                        found = [{"url": query}]
+                    else:
+                        # Count the search before calling the provider, including failed calls.
+                        consume(db, run.org_id, "web")
+                        run.searched += 1
+                        db.commit()
+                        found = search(query)
                     checkpoint["hits"] = found
                     run.checkpoint = dict(checkpoint)
                     db.commit()
@@ -197,8 +204,8 @@ def process_run(run_id: str) -> None:
                 while checkpoint["hit_index"] < len(checkpoint["hits"]):
                     db.refresh(run)
                     if (
-                        (run.scraped >= 12 and not checkpoint["page"])
-                        or run.observations >= 100
+                        (run.scraped >= MAX_SCRAPED_PAGES and not checkpoint["page"])
+                        or run.observations >= MAX_OBSERVATIONS
                         or time.monotonic() >= deadline
                         or run.cancel_requested
                     ):
@@ -249,7 +256,7 @@ def process_run(run_id: str) -> None:
                         run.retry_attempt = 0
                         db.commit()
                     for item in items:
-                        if run.observations >= 100 or run.cancel_requested:
+                        if run.observations >= MAX_OBSERVATIONS or run.cancel_requested:
                             break
                         if store_observation(db, workflow, run, source, item, page):
                             run.observations += 1
@@ -261,8 +268,8 @@ def process_run(run_id: str) -> None:
                     db.commit()
                 if (
                     checkpoint["hit_index"] < len(checkpoint["hits"])
-                    or run.scraped >= 12
-                    or run.observations >= 100
+                    or run.scraped >= MAX_SCRAPED_PAGES
+                    or run.observations >= MAX_OBSERVATIONS
                     or run.cancel_requested
                     or time.monotonic() >= deadline
                 ):
@@ -274,11 +281,24 @@ def process_run(run_id: str) -> None:
                 run.stage = "searching"
                 db.commit()
             db.refresh(run)
-            run.status = "cancelled" if run.cancel_requested else "completed"
-            run.stage = run.status
-            run.finished_at = utcnow()
-            workflow.pause_reason = None
-            run.checkpoint = None
+            if (
+                not run.cancel_requested
+                and run.scraped < MAX_SCRAPED_PAGES
+                and run.observations < MAX_OBSERVATIONS
+                and checkpoint["query_index"] < min(3, len(workflow.queries))
+                and time.monotonic() >= deadline
+            ):
+                run.status = "paused"
+                run.stage = "paused"
+                run.pause_reason = "Run time slice complete; resuming collection"
+                run.next_retry_at = utcnow() + timedelta(minutes=1)
+                workflow.pause_reason = run.pause_reason
+            else:
+                run.status = "cancelled" if run.cancel_requested else "completed"
+                run.stage = run.status
+                run.finished_at = utcnow()
+                workflow.pause_reason = None
+                run.checkpoint = None
         except (QuotaExceeded, ProviderUnavailable) as exc:
             db.rollback()
             run = db.get(Run, run_id)

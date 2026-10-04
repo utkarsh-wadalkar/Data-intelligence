@@ -3,6 +3,7 @@ import ipaddress
 import json
 import re
 import socket
+from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -11,6 +12,7 @@ import httpx
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from ddgs import DDGS
 from pydantic import ValidationError
+from selectolax.lexbor import LexborHTMLParser
 
 from .config import settings
 from .schemas import ApproveRequest
@@ -41,9 +43,7 @@ def ensure_model_ready() -> None:
     config = settings()
     if config.model_provider == "openrouter" and config.openrouter_api_key:
         return
-    if config.model_provider == "ollama":
-        return
-    raise ProviderUnavailable("No eligible free model is configured")
+    raise ProviderUnavailable("Qwen free model is not configured")
 
 
 def public_url(url: str) -> bool:
@@ -65,7 +65,7 @@ def model_json(system: str, user: str, schema: dict) -> dict:
         if not config.openrouter_api_key:
             raise ProviderUnavailable("OpenRouter free API key is missing")
         body = {
-            "models": ["openrouter/free", "qwen/qwen3.8-27b:free"],
+            "model": "qwen/qwen3.8-27b:free",
             "messages": [
                 {
                     "role": "system",
@@ -81,6 +81,7 @@ def model_json(system: str, user: str, schema: dict) -> dict:
                 "data_collection": "deny",
                 "require_parameters": True,
                 "allow_fallbacks": True,
+                "sort": "latency",
             },
             "temperature": 0,
         }
@@ -112,27 +113,7 @@ def model_json(system: str, user: str, schema: dict) -> dict:
             raise ProviderUnavailable(
                 f"OpenRouter returned invalid JSON: {str(exc)[:200]}"
             ) from exc
-    if config.model_provider == "ollama":
-        try:
-            response = httpx.post(
-                f"{config.ollama_base_url.rstrip('/')}/api/chat",
-                json={
-                    "model": "llama3.1",
-                    "stream": False,
-                    "format": schema,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                },
-                timeout=90,
-            )
-            response.raise_for_status()
-            return json.loads(response.json()["message"]["content"])
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
-            raise ProviderUnavailable(f"Local Ollama unavailable: {str(exc)[:200]}") from exc
-    # An unknown or paid adapter must never silently route a request.
-    raise ProviderUnavailable("Only OpenRouter free and local Ollama are enabled")
+    raise ProviderUnavailable("Only the Qwen free model through OpenRouter is enabled")
 
 
 DRAFT_SCHEMA = {
@@ -166,7 +147,8 @@ DRAFT_SCHEMA = {
 
 def plan_prompt(prompt: str) -> ApproveRequest:
     result = model_json(
-        "Design a small public-web data collection plan. Return 1-3 search queries, "
+        "Design a small public-web data collection plan. Return 1-3 search queries "
+        "or exact public URLs supplied by the user, "
         "1-20 typed snake_case fields, and stable identity fields. Never request "
         "login-only or paywalled data.",
         prompt,
@@ -200,9 +182,9 @@ def search(query: str) -> list[dict]:
     try:
         return [
             {"url": hit["href"], "title": hit.get("title", "")}
-            for hit in DDGS(timeout=30).text(query, max_results=4)
+            for hit in DDGS(timeout=15).text(query, max_results=8)
             if isinstance(hit, dict) and isinstance(hit.get("href"), str)
-        ][:4]
+        ][:8]
     except Exception as exc:
         raise ProviderUnavailable(f"Web search unavailable: {str(exc)[:200]}") from exc
 
@@ -304,7 +286,64 @@ async def robots_allowed(url: str) -> bool:
     raise ProviderUnavailable("Robots.txt redirected too many times")
 
 
+async def _fetch_html(url: str):
+    """Use a bounded HTTP fetch for ordinary pages before starting Chromium."""
+    connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
+    timeout = aiohttp.ClientTimeout(total=12)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as client:
+            current = url
+            for _ in range(4):
+                if not await public_request_url(current):
+                    raise ProviderUnavailable("Nonpublic source URL skipped")
+                if not await robots_allowed(current):
+                    raise ProviderUnavailable("Blocked by robots.txt page skipped")
+                async with client.get(current, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ProviderUnavailable("Invalid page redirect skipped")
+                        current = urljoin(current, location)
+                        continue
+                    if response.status in {401, 403, 404, 410}:
+                        raise ProviderUnavailable("Blocked or unavailable page skipped")
+                    if response.status >= 400:
+                        raise ProviderUnavailable("Unavailable page skipped")
+                    if "text/html" not in response.headers.get("Content-Type", "").lower():
+                        return None
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        body.extend(chunk)
+                        if len(body) >= 2_000_000:
+                            break
+                    body = body[:2_000_000]
+                    charset = getattr(response, "charset", None) or "utf-8"
+                    try:
+                        html = body.decode(charset, errors="replace")
+                    except LookupError:
+                        html = body.decode("utf-8", errors="replace")
+                    tree = LexborHTMLParser(html)
+                    title_node = tree.css_first("title")
+                    title = title_node.text(strip=True) if title_node else ""
+                    tree.strip_tags(["script", "style", "noscript", "svg", "form"], recursive=True)
+                    page = (tree.body or tree).text(separator=" ", strip=True)
+                    if len(page) < 80:
+                        return None
+                    return SimpleNamespace(
+                        status_code=response.status,
+                        success=True,
+                        markdown=page,
+                        metadata={"title": title},
+                    )
+            raise ProviderUnavailable("Page redirected too many times skipped")
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        raise ProviderUnavailable(f"Page fetch unavailable skipped: {str(exc)[:200]}") from exc
+
+
 async def _crawl(url: str):
+    fast_result = await _fetch_html(url)
+    if fast_result is not None:
+        return fast_result
     addresses = await public_addresses(url)
     ip = next((address for address in addresses if ":" not in address), None)
     if not ip:
@@ -330,11 +369,9 @@ async def _crawl(url: str):
         result = await crawler.arun(
             url=url,
             config=CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS, page_timeout=45000, check_robots_txt=False
+                cache_mode=CacheMode.BYPASS, page_timeout=20000, check_robots_txt=False
             ),
         )
-        if blocked_navigation:
-            raise ProviderUnavailable("Nonpublic source URL skipped")
         return result
 
 
@@ -345,18 +382,14 @@ def scrape(url: str) -> tuple[str, str]:
         result = asyncio.run(_crawl(url))
         if result.status_code in {401, 403, 404, 410}:
             raise ProviderUnavailable("Blocked or unavailable page skipped")
-        if not result.success:
+        markdown = str(result.markdown or "")
+        if not result.success and not markdown.strip():
             reason = str(result.error_message or "unknown error")[:200]
             if re.search(r"blocked|robots|login|paywall|access denied", reason, re.I):
                 raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
             raise ProviderUnavailable(f"Crawl4AI scrape unavailable: {reason}")
-        markdown = str(result.markdown or "")
-        access_wall = re.search(r"\b(subscribe to read|paywall)\b", markdown[:1500], re.I)
-        sparse_login = len(markdown) < 500 and re.search(
-            r"\b(sign in|log in)\b", markdown[:1500], re.I
-        )
-        if not markdown.strip() or access_wall or sparse_login:
-            raise ProviderUnavailable("Blocked, login-only, or paywalled page skipped")
+        if not markdown.strip():
+            raise ProviderUnavailable("Empty page skipped")
         return str((result.metadata or {}).get("title", ""))[:300], markdown[:30000]
     except ProviderUnavailable:
         raise

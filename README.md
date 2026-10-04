@@ -4,30 +4,30 @@
 
 # SourcePilot
 
-**Turn a plain-English research request into a source-backed dataset.** SourcePilot proposes a collection plan, gathers information from public web pages, and keeps the results searchable, traceable, and ready to export.
+**Turn a plain-English research request into a source-backed dataset.** SourcePilot proposes a collection plan, gathers information from public web pages (including directly supplied, unindexed URLs), and keeps the results searchable, traceable, and ready to export.
 
 [Live app](https://sourcepilot.onrender.com) · [API health](https://utkarshw1625--data-intelligence-api.modal.run/health)
 
 ## How it works
 
 ```text
-Research request → AI-generated plan → human approval → public-web search and scrape
+Research request → AI-generated plan → human approval → public-web search or direct URL collection
                  → evidence-checked observations → cumulative, exportable dataset
 ```
 
 ### 1. Turn a question into a collection plan
 
-For example, ask: *“Find publicly listed companies in Berlin hiring senior product designers. Include company, role, location, posting date, and application link.”* The frontend sends this to `POST /api/drafts`. The backend asks a model to propose an event title, **1–3 web search queries**, **1–20 named and typed fields** (`text`, `number`, `date`, `url`, or `boolean`), and **1–4 identity fields** used to recognize the same item in later runs. The proposal is saved as a draft; it does not search the web yet.
+For example, ask: *“Find publicly listed companies in Berlin hiring senior product designers. Include company, role, location, posting date, and application link.”* The frontend sends this to `POST /api/drafts`. The backend asks a model to propose an event title, **1–3 web search queries or exact public page URLs**, **1–20 named and typed fields** (`text`, `number`, `date`, `url`, or `boolean`), and **1–4 identity fields** used to recognize the same item in later runs. The proposal is saved as a draft; it does not collect pages yet.
 
-The default model provider is OpenRouter. Both planning and page extraction send a server-side `POST` to **`https://openrouter.ai/api/v1/chat/completions`** with this ordered model list:
+The default model provider is OpenRouter. Both planning and page extraction send a server-side `POST` to **`https://openrouter.ai/api/v1/chat/completions`** with one fixed model:
 
 ```json
 {
-  "models": ["openrouter/free", "qwen/qwen3.8-27b:free"]
+  "model": "qwen/qwen3.8-27b:free"
 }
 ```
 
-[`openrouter/free`](https://openrouter.ai/openrouter/free) lets OpenRouter choose an eligible free model; [`qwen/qwen3.8-27b:free`](https://openrouter.ai/qwen/qwen3.8-27b%3Afree) is the explicit free fallback candidate. [OpenRouter tries the `models` list in priority order](https://openrouter.ai/docs/guides/routing/model-fallbacks). The request also sets `allow_fallbacks: true`, `require_parameters: true`, `data_collection: "deny"`, and `temperature: 0`. The backend instructs the model to return one JSON object matching the supplied schema, then parses and validates the result locally. The selected free model can vary with provider availability; SourcePilot does not claim that one fixed model handled every request. `MODEL_PROVIDER=ollama` is a separately configured **local alternative** using Ollama's `/api/chat` endpoint and `llama3.1`, not an automatic fallback from OpenRouter. API keys stay on the backend. See [`backend/app/providers.py`](backend/app/providers.py).
+[`qwen/qwen3.8-27b:free`](https://openrouter.ai/qwen/qwen3.8-27b%3Afree) is the only model used. The request allows backup providers for that same model, prioritizes lower latency providers, and sets `require_parameters: true`, `data_collection: "deny"`, and `temperature: 0`. The backend instructs the model to return one JSON object matching the supplied schema, then parses and validates the result locally. API keys stay on the backend. See [`backend/app/providers.py`](backend/app/providers.py).
 
 ### 2. Let the user approve the plan
 
@@ -35,7 +35,7 @@ The user can edit the proposed searches, field names and types, and identity fie
 
 ### 3. Search and read public pages
 
-The worker searches each approved query with DDGS, requesting up to four web results. It skips duplicate or nonpublic URLs, then uses a local Crawl4AI browser to convert each page to Markdown. Browser requests are pinned to the validated public host, cross-host resources are blocked, page JavaScript is disabled, and `robots.txt` is checked for navigation targets. JavaScript-only pages may be skipped. Blocked, login-only, paywalled, or unavailable pages are skipped. A run is bounded to **three searches and 12 successfully scraped pages**. For each scraped page, the model is asked for at most 20 candidate records in the approved shape, each with a short verbatim evidence excerpt. See [`backend/app/worker.py`](backend/app/worker.py) and [`backend/app/providers.py`](backend/app/providers.py).
+The worker searches each approved query with DDGS, requesting up to eight web results. An approved entry that is an exact public URL is fetched directly, so a publicly reachable page does not need to appear in search results. It skips duplicate URLs and private-network destinations. Ordinary HTML is fetched with a bounded HTTP request and parsed with the open-source Selectolax Lexbor parser; sparse or unsupported HTML falls back to a local Crawl4AI browser. Every HTTP redirect is rechecked for a public DNS destination and `robots.txt` permission. Browser requests are pinned to the validated public host, cross-host resources are blocked, and page JavaScript is disabled. JavaScript-only pages may be skipped. Reachable pages with useful content are kept even if they include sign-in or paywall text; pages that truly require authentication, are blocked by `robots.txt`, or are unavailable cannot be collected. A run is bounded to **three searches and 16 successfully scraped pages**. For each scraped page, the model is asked for at most 20 candidate records in the approved shape, each with a short verbatim evidence excerpt. See [`backend/app/worker.py`](backend/app/worker.py) and [`backend/app/providers.py`](backend/app/providers.py).
 
 ### 4. Check evidence and build a dataset that survives reruns
 
@@ -59,7 +59,7 @@ SourcePilot accepts any active organization in a verified Clerk session and keep
 | API and workers | FastAPI, Python; Modal web endpoint, workers, and minute scheduler |
 | Data | TiDB Cloud (MySQL protocol), SQLAlchemy 2, Alembic |
 | Authentication | Clerk Organizations and verified session JWTs |
-| Collection and extraction | DDGS keyless search and self hosted Crawl4AI; OpenRouter `/api/v1/chat/completions` with `openrouter/free` and `qwen/qwen3.8-27b:free`, returning JSON validated locally |
+| Collection and extraction | DDGS keyless search, direct public URLs, bounded HTTP fetch with Selectolax and Crawl4AI fallback; OpenRouter `/api/v1/chat/completions` with only `qwen/qwen3.8-27b:free`, returning JSON validated locally |
 
 ## Run locally (PowerShell)
 
@@ -109,7 +109,7 @@ Run `alembic upgrade head` manually from `backend/` against TiDB before deployme
 
 ## Cost and recovery limits
 
-Each run is limited to **3 searches, 12 scraped pages, 100 observations, and 10 minutes per execution attempt**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 web requests per UTC month**. Each search attempt and each page crawl attempt reserves one web request. Provider or quota exhaustion pauses work with a visible reason. The minute scheduler dispatches queued work and resumes eligible paused runs using their existing run ID and saved checkpoint. After an OpenRouter 429, automatic retry delays increase through 1, 3, 5, 10, 30, 120, 300, and 1440 minutes; other provider or quota pauses retry after one hour, while the per-run search limit does not auto-retry. A manual retry creates a new run. SourcePilot does not route to paid models or scraping providers.
+Each run is limited to **3 searches, 16 scraped pages, 200 observations, and 8 minutes per execution slice**. Each organization has **one active run**, **20 model calls per UTC day**, and **600 web requests per UTC month**. Each search attempt and each page fetch attempt reserves one web request; direct URLs skip the search request. A time slice saves its checkpoint and resumes through the minute scheduler. Provider or quota exhaustion pauses work with a visible reason. After an OpenRouter 429, automatic retry delays increase through 1, 3, 5, 10, 30, 120, 300, and 1440 minutes; other provider or quota pauses retry after one hour, while the per-run search limit does not auto-retry. A manual retry creates a new run. SourcePilot does not route to paid models or scraping providers.
 
 ## Checks
 

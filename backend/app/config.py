@@ -17,7 +17,6 @@ class Settings(BaseSettings):
     clerk_jwks_url: str = ""
     clerk_issuer: str = ""
     openrouter_api_key: str = ""
-    ollama_base_url: str = "http://localhost:11434"
     model_provider: str = "openrouter"
     allow_paid_providers: bool = False
     dispatch_mode: str = "local"

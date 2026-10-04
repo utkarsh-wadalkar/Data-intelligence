@@ -620,7 +620,7 @@ export default function App() {
               <div className="eyebrow">STEP 02 / REVIEW THE PLAN</div>
               <h1>Choose your record fields.</h1>
               <p className="intro">
-                Review the proposed searches and fields. The schema locks when
+                Review the proposed searches or direct page URLs and fields. The schema locks when
                 the first run begins. You can duplicate the event later to
                 change it.
               </p>
@@ -637,7 +637,7 @@ export default function App() {
                   />
                 </label>
                 <h2>
-                  Searches <span>Up to three</span>
+                  Searches or page URLs <span>Up to three</span>
                 </h2>
                 {approval.queries.map((item, index) => (
                   <label key={index} className="query-row">

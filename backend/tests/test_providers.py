@@ -35,10 +35,12 @@ def test_free_provider_routing_and_local_crawl(monkeypatch):
 
     monkeypatch.setattr(providers.httpx, "post", post)
     assert providers.model_json("system", "user", {"type": "object"}) == {"answer": "ok"}
-    assert calls[0][1]["models"] == ["openrouter/free", "qwen/qwen3.8-27b:free"]
+    assert calls[0][1]["model"] == "qwen/qwen3.8-27b:free"
+    assert "models" not in calls[0][1]
     assert calls[0][1]["provider"]["data_collection"] == "deny"
     assert calls[0][1]["provider"]["require_parameters"] is True
     assert calls[0][1]["provider"]["allow_fallbacks"] is True
+    assert calls[0][1]["provider"]["sort"] == "latency"
     assert "response_format" not in calls[0][1]
     assert '"type": "object"' in calls[0][1]["messages"][0]["content"]
     class Search:
@@ -46,7 +48,7 @@ def test_free_provider_routing_and_local_crawl(monkeypatch):
             pass
 
         def text(self, query, **kwargs):
-            assert kwargs["max_results"] == 4
+            assert kwargs["max_results"] == 8
             return [{"href": "https://example.com", "title": "Example"}]
 
     monkeypatch.setattr(providers, "DDGS", Search)
@@ -100,6 +102,18 @@ def test_openrouter_rate_limit_is_reported_as_rate_limit(monkeypatch):
         providers.model_json("system", "user", {"type": "object"})
 
 
+def test_other_model_provider_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        providers,
+        "settings",
+        lambda: SimpleNamespace(model_provider="ollama", openrouter_api_key="test"),
+    )
+    with pytest.raises(providers.ProviderUnavailable, match="Qwen"):
+        providers.ensure_model_ready()
+    with pytest.raises(providers.ProviderUnavailable, match="Qwen"):
+        providers.model_json("system", "user", {"type": "object"})
+
+
 def test_openrouter_accepts_fenced_json_from_free_model(monkeypatch):
     monkeypatch.setattr(
         providers,
@@ -145,16 +159,50 @@ def test_public_page_with_sign_in_navigation_is_kept(monkeypatch):
     assert providers.scrape("https://example.com/research") == ("Research", page)
 
 
+def test_reachable_page_with_paywall_phrase_and_data_is_kept(monkeypatch):
+    page = "Subscribe to read more. Public finding: Northstar is hiring in Berlin."
+    monkeypatch.setattr(
+        providers,
+        "_crawl",
+        lambda url: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                status_code=200, success=True, markdown=page, metadata={"title": "Jobs"}
+            ),
+        ),
+    )
+    assert providers.scrape("https://example.com/jobs") == ("Jobs", page)
+
+
+def test_partial_browser_result_with_data_is_kept(monkeypatch):
+    page = "Northstar is hiring in Berlin with a public application link."
+    monkeypatch.setattr(
+        providers,
+        "_crawl",
+        lambda url: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                status_code=200,
+                success=False,
+                error_message="A blocked navigation occurred",
+                markdown=page,
+                metadata={"title": "Jobs"},
+            ),
+        ),
+    )
+    assert providers.scrape("https://example.com/jobs") == ("Jobs", page)
+
+
 def test_search_caps_results_and_reports_failure(monkeypatch):
     class Search:
         def __init__(self, **kwargs):
             pass
 
         def text(self, query, **kwargs):
-            return [{"href": f"https://example.com/{i}"} for i in range(5)]
+            return [{"href": f"https://example.com/{i}"} for i in range(10)]
 
     monkeypatch.setattr(providers, "DDGS", Search)
-    assert len(providers.search("example")) == 4
+    assert len(providers.search("example")) == 8
 
     def fail(**kwargs):
         raise RuntimeError("search offline")
@@ -232,8 +280,112 @@ def test_browser_blocks_cross_host_and_robots_disallowed_redirect(monkeypatch):
     asyncio.run(check())
 
 
+def test_static_html_uses_fast_path_without_browser(monkeypatch):
+    html = (
+        "<html><head><title>Research results</title><script>ignore me</script></head>"
+        "<body><main>"
+        + "Public research finding with source details. " * 12
+        + "</main></body></html>"
+    )
+
+    class Connector:
+        async def close(self):
+            pass
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "text/html"}
+
+        def __init__(self):
+            self.content = SimpleNamespace(iter_chunked=self.iter_chunked)
+
+        async def iter_chunked(self, size):
+            encoded = html.encode()
+            yield encoded[: len(encoded) // 2]
+            yield encoded[len(encoded) // 2 :]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class Client:
+        def __init__(self, connector, timeout):
+            self.connector = connector
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await self.connector.close()
+
+        def get(self, url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            return Response()
+
+    monkeypatch.setattr(providers.aiohttp, "TCPConnector", lambda **kwargs: Connector())
+    monkeypatch.setattr(providers.aiohttp, "ClientSession", Client)
+    monkeypatch.setattr(providers, "public_request_url", lambda url: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(providers, "robots_allowed", lambda url: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(
+        providers,
+        "AsyncWebCrawler",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("Browser started")),
+    )
+    result = asyncio.run(providers._crawl("https://example.com/unindexed"))
+    assert result.metadata["title"] == "Research results"
+    assert result.markdown.count("Public research finding") == 12
+    assert "ignore me" not in result.markdown
+
+
+def test_static_fetch_rejects_private_redirect(monkeypatch):
+    requests = []
+
+    class Connector:
+        async def close(self):
+            pass
+
+    class Response:
+        status = 302
+        headers = {"location": "http://127.0.0.1/secrets"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class Client:
+        def __init__(self, connector, timeout):
+            self.connector = connector
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await self.connector.close()
+
+        def get(self, url, **kwargs):
+            requests.append(url)
+            return Response()
+
+    monkeypatch.setattr(providers.aiohttp, "TCPConnector", lambda **kwargs: Connector())
+    monkeypatch.setattr(providers.aiohttp, "ClientSession", Client)
+    monkeypatch.setattr(
+        providers,
+        "public_request_url",
+        lambda url: asyncio.sleep(0, result=providers.public_url(url)),
+    )
+    monkeypatch.setattr(providers, "robots_allowed", lambda url: asyncio.sleep(0, result=True))
+    with pytest.raises(providers.ProviderUnavailable, match="Nonpublic"):
+        asyncio.run(providers._fetch_html("https://example.com/page"))
+    assert requests == ["https://example.com/page"]
+
+
 def test_crawl_pins_approved_host_in_chromium(monkeypatch):
     configs = []
+    monkeypatch.setattr(providers, "_fetch_html", lambda url: asyncio.sleep(0, result=None))
 
     async def resolve(host, port):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port))]
@@ -266,6 +418,7 @@ def test_crawl_pins_approved_host_in_chromium(monkeypatch):
 
 
 def test_crawl_rejects_private_dns_before_starting_browser(monkeypatch):
+    monkeypatch.setattr(providers, "_fetch_html", lambda url: asyncio.sleep(0, result=None))
     async def private_host(host, port):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", port))]
 

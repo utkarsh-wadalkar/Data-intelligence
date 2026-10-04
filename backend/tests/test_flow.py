@@ -162,6 +162,63 @@ def test_empty_search_advances_to_next_query(context, monkeypatch):
     assert client.get(f"/api/runs/{run_id}").json()["status"] == "completed"
 
 
+def test_direct_public_url_bypasses_search(context, monkeypatch):
+    client, sessions, _ = context
+    workflow_id, run_id = make_approved(client)
+    with sessions() as db:
+        db.get(Workflow, workflow_id).queries = ["https://example.com/unindexed"]
+        db.commit()
+    monkeypatch.setattr(
+        worker, "search", lambda query: (_ for _ in ()).throw(AssertionError("Search called"))
+    )
+    monkeypatch.setattr(worker, "scrape", lambda url: ("Unindexed", "Public research page."))
+    monkeypatch.setattr(worker, "extract", lambda page, fields: [])
+
+    worker.process_run(run_id)
+    result = client.get(f"/api/runs/{run_id}").json()
+    assert result["status"] == "completed"
+    assert result["searched"] == 0
+    assert result["scraped"] == 1
+    assert client.get("/api/usage").json()["web"]["used"] == 1
+
+
+def test_run_can_scrape_sixteen_pages(context, monkeypatch):
+    client, sessions, _ = context
+    workflow_id, run_id = make_approved(client)
+    with sessions() as db:
+        db.get(Workflow, workflow_id).queries = ["first", "second"]
+        db.commit()
+    monkeypatch.setattr(
+        worker,
+        "search",
+        lambda query: [{"url": f"https://example.com/{query}/{i}"} for i in range(8)],
+    )
+    monkeypatch.setattr(worker, "scrape", lambda url: ("Results", "Public research page."))
+    monkeypatch.setattr(worker, "extract", lambda page, fields: [])
+    worker.process_run(run_id)
+    result = client.get(f"/api/runs/{run_id}").json()
+    assert result["status"] == "completed"
+    assert result["scraped"] == 16
+
+
+def test_time_slice_saves_checkpoint_for_resume(context, monkeypatch):
+    client, _, _ = context
+    _, run_id = make_approved(client)
+    monkeypatch.setattr(worker, "WORK_SLICE_SECONDS", 0)
+    worker.process_run(run_id)
+    result = client.get(f"/api/runs/{run_id}").json()
+    assert result["status"] == "paused"
+    assert result["next_retry_at"] is not None
+    monkeypatch.setattr(worker, "WORK_SLICE_SECONDS", 480)
+    monkeypatch.setattr(worker, "search", lambda query: [])
+    with worker.SessionLocal() as db:
+        db.get(Run, run_id).next_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+    assert run_id in worker.tick()
+    worker.process_run(run_id)
+    assert client.get(f"/api/runs/{run_id}").json()["status"] == "completed"
+
+
 def test_unsupported_source_does_not_pause_collection(context, monkeypatch):
     client, _, _ = context
     workflow_id, run_id = make_approved(client)
